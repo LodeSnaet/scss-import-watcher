@@ -28,15 +28,15 @@ This CLI simplifies your SCSS workflow by automatically generating and maintaini
     * **Example Import Structure**:
         ```scss
         /* my_main_imports import start */
-        // base
+        /* base */
         @import "base/variables";
         @import "base/mixins";
 
-        // components
+        /* components  */
         @import "components/button";
         @import "components/card";
 
-        // layout
+        /* layout */
         @import "layout/grid";
         /* my_main_imports import end */
         ```
