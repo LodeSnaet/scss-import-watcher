@@ -40,43 +40,40 @@ While powerful, this tool has a few limitations to be aware of:
 ## ⚠️ Important Considerations
 
 * **Floating Imports After Deletion**: When a watcher is deleted, its specific marker comments are removed, but the generated `@import` statements themselves are retained (they become "floating" imports).
-  * If these floating imports are then managed by a **newly created or existing watcher** for the *same content* (e.g., you create a new watcher for the exact same folder), the CLI will not automatically re-home them within the new watcher's markers, be mindful for dublicates.
+  * If these floating imports are then managed by a **newly created or existing watcher** for the *same content* (e.g., you create a new watcher for the exact same folder), the CLI will not automatically re-home them within the new watcher's markers, be mindful for duplicates.
 
 ---
 
-## 🚀 Getting Started
+## 🚀 Getting Started & Usage
 
 To use this CLI, you'll need Node.js installed on your system.
 
-### Installation
+### Installation Options
 
-You can install this package globally using npm, which allows you to run it as a command from any directory:
+There are two primary ways to install and run the `scss-import-watcher` CLI:
 
-```bash
-npm i scss-import-watcher
-```
+#### 1. Project-Specific Installation (Recommended for Project Use)
 
-Follow the interactive prompts:
+This method installs the CLI as a development dependency within your project, allowing it to be managed via `npm scripts`. This is ideal for project-specific automation and ensures consistent versions across your team.
 
-* **Set your Project Root**: Define the base directory of your SCSS project.
-* **Main Menu**: Choose from options like:
-  * **➕ Create new watcher**: Define a folder to watch and the root-level SCSS file for its imports.
-  * **👀 Show watchers**: View a list of all active watchers, and select one to edit or delete it.
-  * **🗑️ Delete watcher(s)**: Stop and remove one or more watchers.
-  * **🚪 Exit**: Close the CLI.
+1.  **Install the package in your project:**
+    Navigate to your project's root directory and install it as a dev dependency:
+    ```bash
+      npm i scss-import-watcher
+    ```
+    *(Note: If you're actively developing the `scss-import-watcher` package locally and testing it within your project without publishing, use `npm link scss-import-watcher-cli` instead of `npm install` after running `npm link` in your package's root.)*
 
----
+2.  **Add a script to your project's `package.json`:**
+    Open your project's `package.json` file and add an entry to the `"scripts"` section to easily run the CLI. We recommend using `npx` to ensure the locally installed version is executed.
 
-## 🤝 Contributing
+    ```json
+    "scripts": {
+      "watch-scss": "npx scss-watcher"
+    }
+    ```
+    Remember to use the command name (`scss-watcher`) that you defined in the `bin` field of the `scss-import-watcher-cli` package's `package.json`.
 
-Contributions are welcome! If you find a bug or have a feature request, please open an issue on the GitHub repository.
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License.
-
----
-
-*Small Note: This project's code and documentation has been significantly shaped and generated with the assistance of an AI language model.*
+3.  **Run the CLI from your project root:**
+    ```bash
+    npm run watch-scss
+    ```
