@@ -1,0 +1,16 @@
+{
+"name": "scss-import-watcher",
+"version": "1.0.0",
+"description": "Automatically watch a folder and update SCSS import statements in styles file",
+"main": "index.js",
+"bin": {
+"scss-import-watcher": "./bin/cli.js"
+},
+"scripts": {},
+"keywords": ["scss", "watcher", "import", "sass", "styles"],
+"author": "Your Name",
+"license": "MIT",
+"dependencies": {
+"chokidar": "^3.5.3"
+}
+}
