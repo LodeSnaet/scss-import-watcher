@@ -53,7 +53,7 @@ To use this CLI, you'll need Node.js installed on your system.
 You can install this package globally using npm, which allows you to run it as a command from any directory:
 
 ```bash
-npm install -g your-scss-watcher-cli
+npm i scss-import-watcher
 ```
 
 Follow the interactive prompts:
