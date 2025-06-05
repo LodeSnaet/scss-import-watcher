@@ -4,7 +4,7 @@
   "description": "Automatically watch a folder and update SCSS import statements in styles file",
   "main": "index.js",
   "bin": {
-    "scss-import-watcher": "bin/cli.js"
+    "scss-import-watcher": "./bin/cli.js"
   },
   "scripts": {},
   "keywords": [
