@@ -1,7 +1,7 @@
 {
   "name": "scss-import-watcher",
   "version": "1.0.0",
-  "description": "Automatically watch a folder and update SCSS import statements in styles file",
+  "description": "Automatically watch selected folder/nested folders and update SCSS import statements in selected styles file",
   "main": "index.js",
   "bin": {
     "scss-import-watcher": "./bin/cli.js"
