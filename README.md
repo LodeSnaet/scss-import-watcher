@@ -11,15 +11,15 @@ This CLI simplifies your SCSS workflow by automatically generating and maintaini
 * **Interactive Setup**: A user-friendly command-line interface guides you through the setup process.
 * **Project Root Definition**: Define a central root directory for your SCSS project.
 * **Flexible Watcher Creation**:
-    * Create **watchers** for any subfolder within your project root.
-    * Specify a **single SCSS file at the root level** (e.g., `main.scss`, `styles.scss`) where all generated `@import` statements will be placed.
-    * **Intelligent Import Management**: Automatically generates and updates `@import` statements for all `.scss` files found within your watched directories.
-    * **Duplicate Prevention**: Smartly detects and removes redundant `@import` statements, ensuring your main SCSS file remains clean and efficient. If you stop a watcher and its imports become "floating," they'll be automatically "re-homed" or removed if a new watcher claims them.
+  * Create **watchers** for any subfolder within your project root.
+  * Specify a **single SCSS file at the root level** (e.g., `main.scss`, `styles.scss`) where all generated `@import` statements will be placed.
+  * **Intelligent Import Management**: Automatically generates and updates `@import` statements for all `.scss` files found within your watched directories.
+  * **Duplicate Prevention**: Smartly detects and removes redundant `@import` statements, ensuring your main SCSS file remains clean and efficient. If you stop a watcher and its imports become "floating," they'll be automatically "re-homed" or removed if a new watcher claims them.
 * **Nested Watcher Exclusions**: Automatically configures exclusions so that nested watchers don't duplicate imports from their parent watchers.
 * **Watcher Management Dashboard**:
-    * **View All Watchers**: Get a clear list of all your active watchers, showing their watched folder and target SCSS file.
-    * **Edit Watchers**: Modify an existing watcher's watched folder, target SCSS file, or even its name. The system handles cleanup and relocation of imports accordingly.
-    * **Delete Watchers**: Remove individual watchers or delete all of them. When deleting a watcher, its markers are removed, and imports are left as "floating" (to be cleaned up if a new watcher claims them).
+  * **View All Watchers**: Get a clear list of all your active watchers, showing their watched folder and target SCSS file.
+  * **Edit Watchers**: Modify an existing watcher's watched folder, target SCSS file, or even its name. The system handles cleanup and relocation of imports accordingly.
+  * **Delete Watchers**: Remove individual watchers or delete all of them. When deleting a watcher, its markers are removed, and imports are left as "floating" (to be cleaned up if a new watcher claims them).
 * **Clean Exit**: Ensures all watchers are gracefully shut down and their managed imports are removed (fully or partially, based on configuration) when you exit the CLI.
 * **Visual Cues**: Uses simple text-based icons (📁, 📄, ↩️) in interactive prompts to enhance readability and navigation.
 
@@ -37,6 +37,13 @@ While powerful, this tool has a few limitations to be aware of:
 
 ---
 
+## ⚠️ Important Considerations
+
+* **Floating Imports After Deletion**: When a watcher is deleted, its specific marker comments are removed, but the generated `@import` statements themselves are retained (they become "floating" imports).
+  * If these floating imports are then managed by a **newly created or existing watcher** for the *same content* (e.g., you create a new watcher for the exact same folder), the CLI will not automatically re-home them within the new watcher's markers, be mindful for dublicates.
+
+---
+
 ## 🚀 Getting Started
 
 To use this CLI, you'll need Node.js installed on your system.
@@ -47,3 +54,29 @@ You can install this package globally using npm, which allows you to run it as a
 
 ```bash
 npm install -g your-scss-watcher-cli
+```
+
+Follow the interactive prompts:
+
+* **Set your Project Root**: Define the base directory of your SCSS project.
+* **Main Menu**: Choose from options like:
+  * **➕ Create new watcher**: Define a folder to watch and the root-level SCSS file for its imports.
+  * **👀 Show watchers**: View a list of all active watchers, and select one to edit or delete it.
+  * **🗑️ Delete watcher(s)**: Stop and remove one or more watchers.
+  * **🚪 Exit**: Close the CLI.
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! If you find a bug or have a feature request, please open an issue on the GitHub repository.
+
+---
+
+## 📄 License
+
+This project is licensed under the MIT License.
+
+---
+
+*Small Note: This project's code and documentation has been significantly shaped and generated with the assistance of an AI language model.*
