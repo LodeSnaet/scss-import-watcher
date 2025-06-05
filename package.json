@@ -17,6 +17,10 @@
   "author": "Your Name",
   "license": "MIT",
   "dependencies": {
-    "chokidar": "^3.6.0"
+    "chokidar": "^3.6.0",
+    "inquirer": "^12.6.3"
+  },
+  "devDependencies": {
+    "prettier": "^3.5.3"
   }
 }
