@@ -14,12 +14,21 @@ This CLI simplifies your SCSS workflow by automatically generating and maintaini
   * Create **watchers** for any subfolder within your project root.
   * Specify a **single SCSS file at the root level** (e.g., `main.scss`, `styles.scss`) where all generated `@import` statements will be placed.
   * **Intelligent Import Management**: Automatically generates and updates `@import` statements for all `.scss` files found within your watched directories.
+* **Custom Marker Support**: Users can define their own custom start and end marker comments in the target SCSS file. The CLI will detect and utilize these user-defined markers to manage `@import` statements, ensuring they stay in their desired location.
+    * **Marker Syntax**: These markers must be valid SCSS comments. Each pair of start and end markers is directly associated with a specific **watcher's folder**. They must follow this exact format:
+        ```scss
+        /* [FOLDER_NAME] import start */
+        @import 'example';
+        /* [[FOLDER_NAME] import end */
+        ```
+      Ensure these marker pairs are unique in your file to avoid conflicts.
+* **Automatic Partial Naming**: When generating `@import` statements, the CLI automatically removes the leading underscore from SCSS partial filenames (e.g., `_variables.scss` becomes `@import "variables";`).
 * **Nested Watcher Exclusions**: Automatically configures exclusions so that nested watchers don't duplicate imports from their parent watchers.
 * **Watcher Management Dashboard**:
   * **View All Watchers**: Get a clear list of all your active watchers, showing their watched folder and target SCSS file.
   * **Edit Watchers**: Modify an existing watcher's watched folder, target SCSS file, or even its name. The system handles cleanup and relocation of imports accordingly.
   * **Delete Watchers**: Remove individual watchers or delete all of them. When deleting a watcher, its markers are removed, and imports are left as "floating" (to be cleaned up manually if a new watcher claims them).
-* **Clean Exit**: Ensures all watchers are gracefully shut down and their managed imports are removed (fully or partially, based on configuration) when you exit the CLI.
+* **Clean Exit**: Ensures all watchers are gracefully shut down and their markers are removed when you exit the CLI. Generated import statements stay in place.
 * **Visual Cues**: Uses simple text-based icons (📁, 📄, ↩️) in interactive prompts to enhance readability and navigation.
 
 ---
