@@ -1,5 +1,4 @@
-# ⚡️ SCSS Import Watcher CLI
-
+# ⚡️ SCSS Import Watcher
 A powerful and intuitive command-line interface tool designed to automate the management of your SCSS `@import` statements. Say goodbye to manually adding or removing imports as your project structure evolves!
 
 ---
