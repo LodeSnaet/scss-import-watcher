@@ -13,7 +13,6 @@ This CLI simplifies your SCSS workflow by automatically generating and maintaini
   * Create **watchers** for any subfolder within your project root.
   * Specify a **single SCSS file at the root level** (e.g., `main.scss`, `styles.scss`) where all generated `@import` statements will be placed.
   * **Intelligent Import Management**: Automatically generates and updates `@import` statements for all `.scss` files found within your watched directories.
-  * **Duplicate Prevention**: Smartly detects and removes redundant `@import` statements, ensuring your main SCSS file remains clean and efficient. If you stop a watcher and its imports become "floating," they'll be automatically "re-homed" or removed if a new watcher claims them.
 * **Nested Watcher Exclusions**: Automatically configures exclusions so that nested watchers don't duplicate imports from their parent watchers.
 * **Watcher Management Dashboard**:
   * **View All Watchers**: Get a clear list of all your active watchers, showing their watched folder and target SCSS file.
