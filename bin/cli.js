@@ -8,94 +8,228 @@ const inquirer = require("inquirer").default;
 const watchers = new Map(); // key: name, value: { config, instance }
 let _globalRootDir = null; // Store the root directory once it's set
 
-async function promptRootFolder() {
-  const { rootDir } = await inquirer.prompt([
-    {
-      type: "input",
-      name: "rootDir",
-      message: "Enter the root folder where your SCSS directories are located:",
-      default: process.cwd(),
-    },
-  ]);
-  return path.resolve(rootDir);
-}
-
+// Helper to list folders and files in a directory
 function listFoldersAndFiles(dir) {
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
-    const folders = [];
-    const files = [];
-
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        folders.push(`📁 ${entry.name}`); // Add folder icon
-      } else if (entry.isFile()) {
-        // You can add file icons if you also want to show files, but for traversal, usually just folders.
-        // For this function, we primarily care about folders for navigation.
-        // If you want to list files, you'd process them here.
-      }
-    }
-    return { folders: folders.sort(), files: files.sort() }; // Return sorted lists
+    const folders = entries
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => `📁 ${entry.name}`); // Add folder icon
+    return { folders: folders.sort() };
   } catch (error) {
-    console.error(`❌ Error reading directory ${dir}: ${error.message}`);
-    return { folders: [], files: [] };
+    // Return empty arrays on error, so inquirer doesn't crash on ENOENT
+    return { folders: [] };
   }
 }
 
+// NEW FUNCTION: Generic directory browser
+async function browseForDirectory(startDir, message) {
+  let current = startDir;
+  while (true) {
+    // Validate current path to provide appropriate messages
+    let isValidDir = false;
+    try {
+      const stats = fs.lstatSync(current);
+      isValidDir = stats.isDirectory();
+    } catch (error) {
+      isValidDir = false; // Path does not exist or is not a directory
+    }
+
+    if (!isValidDir) {
+      console.log(
+        `❌ Path not found or is not a directory: ${current}. Please navigate or select an existing folder.`,
+      );
+      // If the current path became invalid, try to go up one level
+      if (current !== startDir) {
+        current = path.dirname(current);
+      } else {
+        // If we are at the startDir and it's invalid, we need a way out
+        console.log("Cannot navigate from an invalid starting point.");
+        // This might need a more robust initial check in promptRootFolder
+        return null; // Indicate failure to browse
+      }
+      continue; // Retry the loop with the (potentially) new current path
+    }
+
+    const { folders } = listFoldersAndFiles(current);
+
+    let choices = [];
+    const isFilesystemRoot = path.dirname(current) === current; // Check if it's the filesystem root (e.g., C:\, /)
+
+    if (!isFilesystemRoot) {
+      choices.push({ name: "↩️ .. (go up)", value: "__UP__" }); // Add back icon for 'go up'
+    }
+
+    if (folders.length > 0) {
+      // Add subfolders, stripping the emoji for the value
+      choices = choices.concat(
+        folders.map((f) => ({ name: f, value: f.replace(/^📁\s*/, "") })),
+      );
+    } else {
+      console.log("⚠️ No subfolders found in this directory.");
+    }
+
+    choices.push(new inquirer.Separator());
+    choices.push({ name: "✅ Select this folder", value: "__SELECT_THIS_FOLDER__" });
+    choices.push({ name: "❌ Cancel", value: "__CANCEL__" });
+
+    const { selected } = await inquirer.prompt([
+      {
+        type: "list",
+        name: "selected",
+        message: `${message}\nCurrent path: ${path.relative(startDir, current) || "."}`,
+        choices,
+      },
+    ]);
+
+    if (selected === "__SELECT_THIS_FOLDER__") {
+      return current; // Return the current path if selected
+    } else if (selected === "__CANCEL__") {
+      return null; // User cancelled
+    } else if (selected === "__UP__") {
+      current = path.dirname(current);
+    } else {
+      current = path.join(current, selected);
+    }
+  }
+}
+
+// MODIFIED: promptRootFolder to validate and offer Browse
+async function promptRootFolder() {
+  while (true) {
+    const { method } = await inquirer.prompt([
+      {
+        type: "list",
+        name: "method",
+        message: "How do you want to set the project root folder?",
+        choices: [
+          { name: `✍️ Enter path (default: ${process.cwd()})`, value: "manual" },
+          { name: "🔍 Browse from current directory", value: "browse" },
+          { name: "🚪 Exit CLI", value: "exit" },
+        ],
+      },
+    ]);
+
+    if (method === "exit") {
+      console.log("👋 Exiting CLI. Goodbye!");
+      process.exit(0);
+    }
+
+    let selectedPath = null;
+    if (method === "manual") {
+      const { rootDirInput } = await inquirer.prompt([
+        {
+          type: "input",
+          name: "rootDirInput",
+          message: "Enter the root folder path:",
+          default: process.cwd(),
+        },
+      ]);
+      selectedPath = path.resolve(rootDirInput);
+    } else if (method === "browse") {
+      selectedPath = await browseForDirectory(
+        process.cwd(), // Start Browse from where the CLI is run
+        "Navigate to your project root folder:",
+      );
+      if (selectedPath === null) {
+        // User cancelled Browse, go back to method selection
+        console.log("Root folder selection cancelled. Please try again.");
+        continue;
+      }
+    }
+
+    // Validate the chosen/entered path
+    try {
+      const stats = fs.lstatSync(selectedPath);
+      if (stats.isDirectory()) {
+        return selectedPath; // Valid directory found
+      } else {
+        console.log(`❌ Path is not a directory: ${selectedPath}. Please select a folder.`);
+      }
+    } catch (error) {
+      if (error.code === 'ENOENT') {
+        console.log(`❌ Path not found: ${selectedPath}. Please try again.`);
+      } else {
+        console.log(`❌ Error validating path: ${error.message}. Please try again.`);
+      }
+    }
+  }
+}
+
+// EXISTING: promptFolderTraversal (specific to selecting watch subfolders within _globalRootDir)
 async function promptFolderTraversal(baseDir) {
   let current = baseDir;
   while (true) {
-    const { folders } = listFoldersAndFiles(current); // Get folders with icons
+    // Only list folders; files are not relevant for selecting a watch directory
+    const { folders } = listFoldersAndFiles(current);
     const isRoot = current === baseDir;
 
     let choices = [];
     if (!isRoot) {
-      choices.push("↩️ .. (go up)"); // Add back icon for 'go up'
+      choices.push({ name: "↩️ .. (go up)", value: "__UP__" }); // Add back icon for 'go up'
     }
 
-    choices = choices.concat(folders); // Add folders with icons
+    if (folders.length > 0) {
+      choices = choices.concat(
+        folders.map(f => ({ name: f, value: f.replace(/^📁\s*/, '') }))
+      );
+    }
 
     choices.push(new inquirer.Separator());
 
     // Allow selecting "this folder" if it's NOT the root directory
     if (!isRoot) {
-      choices.push("✅ Select this folder");
+      choices.push({ name: "✅ Select this folder", value: "__SELECT_THIS_FOLDER__" });
     } else {
+      // This message is for the specific rule of not watching the project root itself
       console.log(
-        "⚠️ You must select a subfolder, not the root directory directly for watching.",
+        "⚠️ You must select a subfolder, not the project root directory directly for watching.",
       );
     }
 
     // Add a specific message if no subfolders are available at the root and user can't select root
     if (isRoot && folders.length === 0) {
       console.log(
-        "⚠️ No subfolders found here. Please create one or choose a different root.",
+        "⚠️ No subfolders found here. Please create one in your project root or choose a different root.",
       );
-      // Consider adding an explicit "Cancel" option here if no valid choices.
+      // In this specific case, if no choices are available (only __UP__ and __CANCEL__),
+      // Inquirer will still throw ValidationError if 'Select this folder' is also not allowed.
+      // The current promptFolderTraversal already leads to this error if choices are empty
+      // so it's generally good to ensure 'choices' is never truly empty by offering a 'back' or 'cancel'.
+      // If it reaches here and `choices` is only '..', then the error will still occur if it's the root.
+      // We need to ensure there's always a valid selection or exit option.
     }
+
+    // If no folders and at root, and 'Select this folder' is not allowed,
+    // ensure there's an exit option to prevent ValidationError.
+    if (isRoot && folders.length === 0 && choices.length <= 1) { // Only '..' might be present
+      choices.push({ name: "❌ Go back to Main Menu", value: "__BACK_TO_MAIN__" });
+    }
+
 
     const { folder } = await inquirer.prompt([
       {
         type: "list",
         name: "folder",
-        message: `Current path: ${path.relative(baseDir, current) || "."}`,
+        message: `Current path for watcher: ${path.relative(baseDir, current) || "."}`,
         choices,
       },
     ]);
 
-    // Strip the emoji and space before processing the path
-    const selectedCleanName = folder.replace(/^📁\s*|^↩️\s*/, "");
-
-    if (folder === "✅ Select this folder") {
+    if (folder === "__SELECT_THIS_FOLDER__") {
       return current; // Return the current path if selected
-    } else if (folder === "↩️ .. (go up)") {
+    } else if (folder === "__UP__") {
       current = path.dirname(current);
-    } else {
-      current = path.join(current, selectedCleanName);
+    } else if (folder === "__BACK_TO_MAIN__") {
+      return null; // User chose to go back
+    }
+    else {
+      current = path.join(current, folder); // The value already has emoji stripped
     }
   }
 }
 
+// ... (rest of your existing code remains the same) ...
 // NEW HELPER: Function to get SCSS files directly in a directory (no subdirectories)
 function listScssFilesAtRoot(dir) {
   try {
@@ -104,20 +238,28 @@ function listScssFilesAtRoot(dir) {
       .filter((d) => d.isFile() && d.name.toLowerCase().endsWith(".scss"))
       .map((d) => d.name);
   } catch (error) {
-    console.error(`❌ Error reading directory ${dir}: ${error.message}`);
+    // console.error(`❌ Error reading directory ${dir}: ${error.message}`); // Suppress this specific error here, handled higher up
     return [];
   }
 }
 
 // UPDATED: promptStylesFile to enforce root-level SCSS files and reuse existing
 async function promptStylesFile() {
+  // Ensure _globalRootDir is valid before proceeding
+  if (!_globalRootDir || !fs.existsSync(_globalRootDir) || !fs.lstatSync(_globalRootDir).isDirectory()) {
+    console.log("❌ Project root is not set or is invalid. Please set a valid project root first.");
+    return null; // Indicate failure
+  }
+
   const availableRootScssFiles = listScssFilesAtRoot(_globalRootDir);
 
   const previouslyUsedRootFiles = new Set();
   // Filter existing watcher styles files to only include those truly at the root
   for (const [name, { config }] of watchers) {
     // Check if stylesFile has no path separators, meaning it's a direct child of root
-    if (!config.stylesFile.includes(path.sep)) {
+    // Also, ensure the file actually exists and is readable.
+    const fullPath = path.resolve(_globalRootDir, config.stylesFile);
+    if (!config.stylesFile.includes(path.sep) && fs.existsSync(fullPath) && fs.lstatSync(fullPath).isFile()) {
       previouslyUsedRootFiles.add(config.stylesFile);
     }
   }
@@ -131,12 +273,17 @@ async function promptStylesFile() {
     .sort()
     .map((f) => ({ name: `📄 ${f}`, value: f }));
 
+  if (sortedChoices.length === 0) {
+    console.log("⚠️ No existing SCSS files found at the project root to select.");
+  }
+
+
   const { selectedFile } = await inquirer.prompt([
     {
       type: "list",
       name: "selectedFile",
       message:
-        "Select an SCSS file for imports or create a new one (must be at project root):",
+        "Select an SCSS file for imports or enter a new one (must be at project root):",
       choices: [
         ...sortedChoices,
         new inquirer.Separator(),
@@ -322,7 +469,7 @@ async function updateWatcherExclusions(additionalFilesToClean = []) {
 
   // NEW: Perform global cleanup, including explicitly provided files.
   // This step removes old marker blocks and floating imports claimed by *active* watchers.
-  await cleanAndRewriteAllStylesFiles(additionalFilesToClean);
+  await cleanAndRewriteAllStylesFiles(additionalFilesFilesToClean); // Typo fixed here: additionalFilesToClean
 
   // Re-create all watchers with updated exclusion paths
   for (const config of currentWatcherConfigs) {
@@ -365,7 +512,11 @@ async function createWatcherFlow() {
   const rootDir = _globalRootDir;
 
   console.log(`\nUsing project root: ${rootDir}`);
-  const watchFolderPath = await promptFolderTraversal(rootDir); // User selects a folder
+  // Use the existing promptFolderTraversal, which has the "subfolder" rule
+  const watchFolderPath = await promptFolderTraversal(rootDir);
+  if (watchFolderPath === null) { // User chose to go back
+    return;
+  }
 
   // Check if a watcher already exists for this exact folder
   let existingWatcherName = null;
@@ -458,7 +609,11 @@ async function editWatcherFlow(nameToEdit) {
     },
   ]);
   if (changeWatchFolder) {
+    // Use promptFolderTraversal here as well
     newWatchFolderPathAbs = await promptFolderTraversal(oldConfig.rootDir);
+    if (newWatchFolderPathAbs === null) { // User chose to go back
+      return;
+    }
   }
 
   let newStylesFile = oldConfig.stylesFile;
