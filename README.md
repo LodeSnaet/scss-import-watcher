@@ -1,5 +1,6 @@
 # ⚡️ SCSS Import Watcher
 A powerful and intuitive command-line interface tool designed to automate the management of your SCSS `@import` statements. Say goodbye to manually adding or removing imports as your project structure evolves!
+This tool is particularly helpful for projects utilizing SCSS partials alongside modern build tools like Vite, Webpack, or Rollup, which often rely on a single entry point for your SCSS.
 
 ---
 
