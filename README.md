@@ -39,7 +39,7 @@ While powerful, this tool has a few limitations to be aware of:
 
 * **No SCSS Compilation**: This tool **does not compile your SCSS** into CSS. You'll need a separate SCSS compiler (like Node-Sass, Dart Sass, or a build tool like Webpack/Gulp) for that.
 * **Directory Watching Only**: Watchers monitor entire directories for `.scss` files; they do not target individual files for specific content.
-* **Root-Level Styles File**: The target SCSS file where imports are written (`stylesFile`) **must reside directly in the root directory you define when starting the CLI** (i.e., the "Project Root" you select in the initial prompt). It cannot be in a subfolder of *that* selected root.
+* **Root-Level Styles File**: The target SCSS file where imports are written **must reside directly in the root directory you define when starting the CLI** (i.e., the "Project Root" you select in the initial prompt). It cannot be in a subfolder of *that* selected root.
 * **Text-Based UI**: The CLI uses basic console prompts. It does not provide a graphical user interface (GUI) or rich visual elements beyond standard Unicode characters.
 * **SCSS `@import` Specific**: It specifically manages `@import` statements for SCSS files and does not handle other types of CSS `@import` or `@use` rules outside of its scope.
 
