@@ -23,7 +23,24 @@ This CLI simplifies your SCSS workflow by automatically generating and maintaini
         ```
       Ensure these marker pairs are unique in your file to avoid conflicts.
 * **Automatic Partial Naming**: When generating `@import` statements, the CLI automatically removes the leading underscore from SCSS partial filenames (e.g., `_variables.scss` becomes `@import "variables";`).
-* **Nested Watcher Exclusions**: Automatically configures exclusions so that nested watchers don't duplicate imports from their parent watchers.
+* **Nested Watcher Exclusions & Organized Imports**: This feature intelligently prevents duplicate `@import` statements when you set up multiple watchers covering overlapping or nested directories.
+    * **Intelligent Grouping**: To prevent redundancy and maintain clarity, the CLI automatically groups imported files by their source folder within your target SCSS file. It inserts comments like `// foldername` above each group of imports. This internal organization assists the CLI in preventing a file (e.g., `_button.scss`) from being imported multiple times if its folder and a broader parent folder are both watched.
+    * **Example Import Structure**:
+        ```scss
+        /* my_main_imports import start */
+        // base
+        @import "base/variables";
+        @import "base/mixins";
+
+        // components
+        @import "components/button";
+        @import "components/card";
+
+        // layout
+        @import "layout/grid";
+        /* my_main_imports import end */
+        ```
+      In this example, `// base`, `// components`, and `// layout` are the grouping comments.
 * **Watcher Management Dashboard**:
   * **View All Watchers**: Get a clear list of all your active watchers, showing their watched folder and target SCSS file.
   * **Edit Watchers**: Modify an existing watcher's watched folder, target SCSS file, or even its name. The system handles cleanup and relocation of imports accordingly.
