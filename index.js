@@ -79,12 +79,30 @@ function scssImportWatcher(options) {
     // console.log(`[${name}] ${message}`); // Changed from label to name
   };
 
+  /**
+   * Normalizes an SCSS import path to POSIX style and removes leading underscores from partials.
+   * For example: "test2\\hello\\_hellotest.scss" becomes "test2/hello/hellotest".
+   * @param {string} relativePath - The relative path of the SCSS file (e.g., "test2/hello/_hellotest.scss")
+   * @returns {string} The normalized import path without leading underscores on partials or .scss extension.
+   */
   function normalizeImportPath(relativePath) {
     let normalized = relativePath.replace(/\\/g, "/"); // Convert to POSIX style
-    // Remove leading underscores for partials (e.g., _button.scss -> button)
-    // Remove .scss extension
-    normalized = normalized.replace(/^_/, "").replace(/\.scss$/, "");
-    return normalized;
+
+    // Split into directory and filename
+    const dir = path.dirname(normalized);
+    let base = path.basename(normalized);
+
+    // Remove leading underscore from the filename part if it's a partial
+    // This targets files like "_hellotest.scss"
+    if (base.startsWith('_')) {
+      base = base.substring(1);
+    }
+
+    // Remove .scss extension from the filename part
+    base = base.replace(/\.scss$/, "");
+
+    // Recombine the path and ensure it's still POSIX style
+    return path.posix.join(dir, base); // Use path.posix for consistent forward slashes
   }
 
   function generateImports() {
@@ -144,15 +162,17 @@ function scssImportWatcher(options) {
       log(`  - Considering file: ${relativeFilePath}`);
 
       let importStatementPath;
+      // Note: The `isPartial` check here is still needed for the initial import path determination,
+      // but `normalizeImportPath` will handle removing the underscore for the final output path.
       let isPartial = fileName.startsWith("_");
 
       if (isPartial) {
         importStatementPath = normalizeImportPath(relativeFilePath);
       } else if (fileName === 'index.scss') {
-        if (dirName === watchDir) { // If index.scss is in the current watcher's watchDir itself
-          importStatementPath = watchDir;
-        } else if (dirName.startsWith(watchDir + '/')) { // If index.scss is in a sub-directory of the current watcher's watchDir
-          importStatementPath = dirName;
+        // If index.scss is in the current watcher's watchDir itself, or a sub-directory
+        // We use the normalized dirName as the import path.
+        if (dirName === watchDir.replace(/\\/g, "/") || dirName.startsWith(watchDir.replace(/\\/g, "/") + '/')) {
+          importStatementPath = normalizeImportPath(dirName + '/' + fileName); // Normalize the full path
         } else {
           log(`    Warning: index.scss at unexpected path: ${relativeFilePath} for current watcher.`);
           return;

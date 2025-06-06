@@ -96,7 +96,6 @@ function startWatchingConfigFile() {
   });
 
   configFileWatcher.on('change', () => {
-    console.log(`\n🔄 Config file ${path.basename(configPath)} changed externally. Reloading watchers...`);
     handleExternalConfigChange();
   });
   configFileWatcher.on('error', (error) => {
@@ -106,24 +105,85 @@ function startWatchingConfigFile() {
 
 // Function to handle external config file changes
 async function handleExternalConfigChange() {
-  // Stop all current watchers
+  console.log(`\n🔄 Config file ${path.basename(getWatchersConfigPath())} changed externally.`);
+
+  // Store current global settings and watcher configurations before attempting to load new ones
+  const oldGlobalRootDir = _globalRootDir;
+  const oldGlobalStylesFile = _globalStylesFile;
+  const oldWatcherConfigs = { ...watcherConfigs }; // Shallow copy for comparison
+
+  // Temporarily stop all current watchers before reloading configs
   for (const [name, { instance }] of watchers) {
     if (instance) {
+      instance.removeMarkers(true); // Clean up old markers AND their contents before closing
       instance.close();
     }
   }
   watchers.clear(); // Clear the map of active watchers
 
-  // Reload configurations
-  loadConfigs(); // This will update _globalRootDir, _globalStylesFile, watcherConfigs
+  // Reload configurations from file
+  const configLoaded = loadConfigs(); // This updates _globalRootDir, _globalStylesFile, watcherConfigs
+  if (!configLoaded) {
+    console.log("Failed to reload configurations. Reverting to previous settings.");
+    // Revert to old configs if loading failed completely
+    _globalRootDir = oldGlobalRootDir;
+    _globalStylesFile = oldGlobalStylesFile;
+    watcherConfigs = oldWatcherConfigs;
+    // Attempt to re-initialize based on old configs
+    for (const name in watcherConfigs) {
+      await loadAndInitializeWatcher(name);
+    }
+    return;
+  }
 
-  // Re-initialize all watchers based on the reloaded config
+  let globalSettingsChanged = false;
+  if (_globalRootDir !== oldGlobalRootDir) {
+    console.log(`\n⚠️ Detected change in Project Root:`);
+    console.log(`   Old: ${oldGlobalRootDir}`);
+    console.log(`   New: ${_globalRootDir}`);
+    globalSettingsChanged = true;
+  }
+  if (_globalStylesFile !== oldGlobalStylesFile) {
+    console.log(`\n⚠️ Detected change in Global Styles File:`);
+    console.log(`   Old: ${oldGlobalStylesFile}`);
+    console.log(`   New: ${_globalStylesFile}`);
+    globalSettingsChanged = true;
+  }
+
+  if (globalSettingsChanged) {
+    const { confirmGlobalUpdate } = await inquirer.prompt([
+      {
+        type: 'confirm',
+        name: 'confirmGlobalUpdate',
+        message: 'Global project settings (root directory or styles file) have changed. Do you want to apply these changes? (Choosing No will revert to previous settings and re-initialize watchers based on them)',
+        default: true,
+      },
+    ]);
+
+    if (!confirmGlobalUpdate) {
+      console.log("Global settings update cancelled. Reverting to previous settings.");
+      // Revert _globalRootDir and _globalStylesFile to their old values
+      _globalRootDir = oldGlobalRootDir;
+      _globalStylesFile = oldGlobalStylesFile;
+      // Revert watcher configs to old state as well, since they might be invalid with reverted global paths
+      watcherConfigs = oldWatcherConfigs;
+      saveConfigs(); // Save the reverted state to overwrite the external change
+      console.log("Previous global settings restored.");
+    } else {
+      console.log("Applying new global settings.");
+      // New global settings are already loaded in _globalRootDir and _globalStylesFile
+      saveConfigs(); // Save the new global settings
+    }
+  } else {
+    // If global settings didn't change, but individual watcher configs might have, just re-initialize.
+    console.log("No changes in global settings. Re-initializing watchers based on updated configurations.");
+  }
+
+  // Re-initialize all watchers based on the (potentially reverted or new) reloaded config
   for (const name in watcherConfigs) {
     await loadAndInitializeWatcher(name); // Use await here
   }
   console.log("✅ Watchers reloaded and reinitialized.");
-  // No need to call mainMenu here, it's called after initial load.
-  // The program will just continue its loop.
 }
 
 // Helper to list folders and files in a directory
