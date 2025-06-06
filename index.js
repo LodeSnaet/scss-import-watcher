@@ -184,21 +184,22 @@ function scssImportWatcher(options) {
           const currentWatcherRelativeWatchDir = watchDir.replace(/\\/g, "/");
 
           // Check 1: Is the other watcher's directory a direct sub-directory of *this* watcher's directory?
+          // This makes sure we only consider child watchers, not sibling or parent watchers.
           const isOtherWatcherDescendant = otherWatcherRelativeWatchDir.startsWith(currentWatcherRelativeWatchDir + '/');
 
           // Check 2: Is the current file being processed located within that more specific watcher's directory?
           const isFileWithinOtherWatcherScope = relativeFilePath.startsWith(otherWatcherRelativeWatchDir + '/');
 
 
-          log(`    - Comparing with other watcher "${otherWatcherConfig.name}" (watchDir: "${otherWatcherRelativeWatchDir}")`);
-          log(`      - Is "${otherWatcherConfig.name}" a descendant of "${name}"? ${isOtherWatcherDescendant}`);
-          log(`      - Is file "${relativeFilePath}" within "${otherWatcherRelativeWatchDir}" scope? ${isFileWithinOtherWatcherScope}`);
+          // log(`    - Comparing with other watcher "${otherWatcherConfig.name}" (watchDir: "${otherWatcherRelativeWatchDir}")`);
+          // log(`      - Is "${otherWatcherConfig.name}" a descendant of "${name}"? ${isOtherWatcherDescendant}`);
+          // log(`      - Is file "${relativeFilePath}" within "${otherWatcherRelativeWatchDir}" scope? ${isFileWithinOtherWatcherScope}`);
 
 
           if (isOtherWatcherDescendant && isFileWithinOtherWatcherScope) {
             isManagedByMoreSpecificWatcher = true;
             log(`    Skipping ${relativeFilePath} for watcher "${name}" because it's handled by more specific watcher "${otherWatcherConfig.name}" (${otherWatcherRelativeWatchDir}).`);
-            break;
+            break; // No need to check other watchers, this file is managed elsewhere
           }
         }
       }
