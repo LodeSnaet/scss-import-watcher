@@ -28,7 +28,7 @@ function getImportPathFromLine(line) {
 
 // Helper function to escape special characters in a string for use in a RegExp
 function escapeRegExp(string) {
-  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the matched substring
+  return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); // $& means the matched substring
 }
 
 /**
@@ -38,238 +38,259 @@ function escapeRegExp(string) {
  * @param {string} options.stylesFile - Styles file to update (relative to rootDir)
  * @param {string} options.label - Label for logging
  * @param {number} options.line - The 1-indexed line number in stylesFile where the marker block should be placed.
- * @param {string} [options.markerId] - Unique identifier for markers (e.g., watcher name). Defaults to basename of watchDir
- * @param {string[]} [options.excludePaths] - Array of absolute paths to exclude from watching.
+ * @param {string} [options.markerId] - Unique identifier for markers (e.g., watcher name). Defaults to basename of watchDir.
+ * @param {string[]} [options.excludePaths=[]] - Array of absolute paths to exclude from watching.
  */
 function scssImportWatcher(options) {
-  const { rootDir, watchDir, stylesFile, label, line, markerId, excludePaths = [] } = options;
+  const rootDir = options.rootDir;
+  const watchDir = path.resolve(rootDir, options.watchDir);
+  const stylesFilePath = path.resolve(rootDir, options.stylesFile);
+  const label = options.label || path.basename(options.watchDir);
+  const insertLine = options.line - 1; // Convert to 0-indexed
+  const effectiveMarkerId = options.markerId || path.basename(options.watchDir);
 
-  // Define effectiveMarkerId in the main scope of scssImportWatcher
-  const effectiveMarkerId = markerId || path.basename(watchDir);
+  // Define marker strings based on the new format
+  const markerStart = `/* ${effectiveMarkerId} import start */`;
+  const markerEnd = `/* ${effectiveMarkerId} import end */`;
 
-  const watchFolder = path.resolve(rootDir, watchDir);
-  const stylesFilePath = path.resolve(rootDir, stylesFile);
+  // Define group marker prefix
+  const GROUP_MARKER_PREFIX = `/*`;
+  const GROUP_MARKER_SUFFIX = `*/`;
 
-  const markerStart = `/* SCSS_IMPORTS_START_${effectiveMarkerId} */`;
-  const markerEnd = `/* SCSS_IMPORTS_END_${effectiveMarkerId} */`;
+  let _currentGroupedImportsCache = {}; // Stores imports grouped by their top-level directory (e.g., 'components': ['@import "components/button";'])
+  let _isActive = true; // New state for pause/resume
 
-  let _currentGeneratedImportPathsCache = new Set();
-  let _currentGroupedImportsCache = {}; // Stores imports grouped by watch subfolder
-  let _isActive = true; // New: Watcher active state
-
-  const log = (message, type = "info") => {
-    if (!_isActive && type !== "error") {
-      // Don't log info/warn messages if paused, but always log errors
-      return;
+  // Basic logging function
+  const log = (message) => {
+    // Only log if the watcher is active, unless it's a critical error or shutdown message
+    if (_isActive || message.startsWith("❌") || message.startsWith("👋") || message.startsWith("⚙️")) {
+      console.log(`[SCSS Watcher - ${label}] ${message}`);
     }
-    const prefix = {
-      info: "ℹ️",
-      warn: "⚠️",
-      error: "❌",
-    }[type];
-    console.log(`${prefix} [${label || effectiveMarkerId || "scss-watcher"}] ${message}`);
   };
 
-
   function generateImports() {
-    _currentGeneratedImportPathsCache.clear();
-    _currentGroupedImportsCache = {};
-
     if (!_isActive) {
-      log("Skipping import generation: Watcher is paused.", "info");
+      // log("Skipping import generation: Watcher is paused.");
       return;
     }
 
-    try {
-      const files = fs.readdirSync(watchFolder, { recursive: true, withFileTypes: true });
+    _currentGroupedImportsCache = {}; // Reset for each run
 
-      for (const file of files) {
-        if (file.isFile() && file.name.endsWith(".scss")) {
-          const filePathAbsolute = path.join(file.path, file.name);
-
-          // Check for exclusion paths
-          const isExcluded = excludePaths.some(excludedPath =>
-              filePathAbsolute.startsWith(excludedPath)
-          );
-          if (isExcluded) {
-            log(`Ignoring excluded file: ${path.relative(rootDir, filePathAbsolute)}`, "info");
-            continue;
-          }
-
-          if (filePathAbsolute === stylesFilePath) {
-            // log(`Ignoring main styles file: ${path.relative(rootDir, stylesFilePath)}`, "info");
-            continue; // Skip the main styles file itself
-          }
-
-          // Check if it's a partial (starts with '_')
-          if (file.name.startsWith("_")) {
-            const importPath = path.relative(watchFolder, filePathAbsolute);
-            // Normalize to POSIX style and remove leading underscore and extension
-            const normalizedImportPath = importPath
-                .replace(/\\/g, "/") // Convert to POSIX
-                .replace(/^_/, "") // Remove leading underscore
-                .replace(/\.scss$/, ""); // Remove .scss extension
-
-            _currentGeneratedImportPathsCache.add(normalizedImportPath);
-
-            const relativeToWatchDir = path.relative(watchFolder, filePathAbsolute);
-            const parentDirKey = path.dirname(relativeToWatchDir);
-            if (!_currentGroupedImportsCache[parentDirKey]) {
-              _currentGroupedImportsCache[parentDirKey] = [];
-            }
-            _currentGroupedImportsCache[parentDirKey].push(normalizedImportPath);
-          }
-        }
+    // Recursive function to read directories
+    function readDirRecursive(currentDir) {
+      if (!fs.existsSync(currentDir)) {
+        log(`Warning: Directory not found - ${currentDir}`);
+        return;
       }
-      log(`Generated imports for ${Object.values(_currentGroupedImportsCache).flat().length} files.`);
-    } catch (err) {
-      log(`❌ Error generating imports from ${watchFolder}: ${err.message}`, "error");
+
+      const files = fs.readdirSync(currentDir);
+      files.forEach((file) => {
+        const fullPath = path.join(currentDir, file);
+        const stat = fs.statSync(fullPath);
+
+        if (stat.isDirectory()) {
+          // Check if directory should be excluded (absolute path comparison)
+          const isExcluded = (options.excludePaths || []).some(excludedPath =>
+              fullPath === path.resolve(rootDir, excludedPath) || fullPath.startsWith(path.resolve(rootDir, excludedPath) + path.sep)
+          );
+          if (!isExcluded) {
+            readDirRecursive(fullPath); // Recurse into subdirectories
+          }
+        } else if (stat.isFile() && file.startsWith("_") && file.endsWith(".scss")) {
+          // It's a SCSS partial, add to imports
+          let relativePathToWatchDir = path.relative(watchDir, fullPath);
+          relativePathToWatchDir = relativePathToWatchDir.replace(/\\/g, "/"); // Normalize to POSIX
+
+          const dirName = path.dirname(relativePathToWatchDir);
+          const baseName = path.basename(relativePathToWatchDir, '.scss');
+
+          // Only remove leading underscore from the filename part
+          let formattedBaseName = baseName;
+          if (formattedBaseName.startsWith('_')) {
+            formattedBaseName = formattedBaseName.substring(1);
+          }
+
+          // Reconstruct the import path without the .scss extension
+          const importPath = path.posix.join(dirName, formattedBaseName);
+
+          // Determine the group key (top-level directory relative to watchDir)
+          const parts = relativePathToWatchDir.split('/');
+          const groupKey = parts.length > 1 ? parts[0] : 'base'; // Use the first part as group or 'base' for direct files
+
+          if (!_currentGroupedImportsCache[groupKey]) {
+            _currentGroupedImportsCache[groupKey] = [];
+          }
+          _currentGroupedImportsCache[groupKey].push(`@import "${importPath}";`);
+        }
+      });
     }
+
+    readDirRecursive(watchDir);
+
+    // Sort imports within each group alphabetically
+    for (const groupKey in _currentGroupedImportsCache) {
+      _currentGroupedImportsCache[groupKey].sort();
+    }
+    // Sort group keys to ensure consistent order (e.g., 'base' first, then alphabetical)
+    const sortedGroupKeys = Object.keys(_currentGroupedImportsCache).sort((a, b) => {
+      if (a === 'base') return -1;
+      if (b === 'base') return 1;
+      return a.localeCompare(b);
+    });
+
+    const sortedCache = {};
+    sortedGroupKeys.forEach(key => {
+      sortedCache[key] = _currentGroupedImportsCache[key];
+    });
+    _currentGroupedImportsCache = sortedCache; // Update cache with sorted groups
   }
 
-  function updateStylesFile(initial = false) {
-    if (!_isActive && !initial) { // Allow initial update even if paused
-      log("Skipping styles file update: Watcher is paused.", "info");
-      return;
-    }
-
+  function updateStylesFile(initialUpdate = false) {
     if (!fs.existsSync(stylesFilePath)) {
-      log(`❌ Styles file not found: ${stylesFilePath}`, "error");
+      log(`Styles file not found: ${stylesFilePath}. Please create it.`);
       return;
     }
 
     try {
       let content = fs.readFileSync(stylesFilePath, "utf8");
-      let lines = content.split(/\r?\n/);
+      // FIX: Use '\n' for actual newline character
+      const lines = content.split('\n');
 
-      const newImports = Array.from(_currentGeneratedImportPathsCache)
-          .sort()
-          .map((p) => `@import "${p}";`);
+      let startIndex = -1;
+      let endIndex = -1;
+
+      // Find marker positions
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].includes(markerStart)) {
+          startIndex = i;
+        }
+        if (lines[i].includes(markerEnd)) {
+          endIndex = i;
+        }
+      }
+
+      let newImportsContent = "";
+      if (Object.keys(_currentGroupedImportsCache).length > 0) {
+        for (const groupKey in _currentGroupedImportsCache) {
+          if (_currentGroupedImportsCache[groupKey].length > 0) {
+            // FIX: Use '\n' for actual newline character
+            newImportsContent += `${GROUP_MARKER_PREFIX} ${groupKey} ${GROUP_MARKER_SUFFIX}\n`;
+            newImportsContent += _currentGroupedImportsCache[groupKey].join('\n') + '\n';
+          }
+        }
+        newImportsContent = newImportsContent.trimEnd(); // Remove trailing newline if any, as we add one at end of block
+      }
+
 
       let newContentLines = [];
-      let inMarkerBlock = false;
-      let inserted = false;
 
-      for (let i = 0; i < lines.length; i++) {
-        const lineContent = lines[i];
-
-        if (lineContent.includes(markerStart)) {
-          inMarkerBlock = true;
-          // When we hit the start marker, we replace the existing block
-          // with our generated imports (or empty if none).
-          newContentLines.push(markerStart);
-          if (newImports.length > 0) {
-            newContentLines.push(""); // Add a blank line for spacing before imports
-            newContentLines.push(...newImports);
-            newContentLines.push(""); // Add a blank line for spacing after imports
-          }
-          newContentLines.push(markerEnd);
-          inserted = true;
-          continue; // Skip existing imports in the block
-        }
-
-        if (lineContent.includes(markerEnd)) {
-          inMarkerBlock = false;
-          continue; // Skip the old end marker as it's already added with new block
-        }
-
-        if (!inMarkerBlock) {
-          newContentLines.push(lineContent);
-        }
-      }
-
-      if (!inserted) {
-        // If markers weren't found, insert at the specified line number
-        const insertAt = Math.min(Math.max(0, line - 1), newContentLines.length);
-
-        const importsBlockLines = [
-          markerStart,
-          // Add blank line before imports if there are imports
-          ...(newImports.length > 0 ? ["", ...newImports] : []),
-          // Add blank line after imports if there are imports
-          ...(newImports.length > 0 ? [""] : []), // This blank line ensures separation from subsequent content
-          markerEnd,
-        ];
-
-        // Use spread operator to insert individual lines from the block
-        newContentLines.splice(insertAt, 0, ...importsBlockLines);
-
-        log(`No existing markers found. Inserted imports at line ${line}.`);
+      // If markers exist, replace content between them
+      if (startIndex !== -1 && endIndex !== -1 && startIndex < endIndex) {
+        // Content before start marker
+        newContentLines = lines.slice(0, startIndex + 1);
+        // Insert new imports
+        newContentLines.push(newImportsContent);
+        // Content after end marker
+        newContentLines = newContentLines.concat(lines.slice(endIndex));
       } else {
-        log(`Updated imports in ${path.basename(stylesFilePath)}.`);
+        // If markers don't exist, insert them at the specified line or end of file
+        const insertionLine = Math.min(insertLine, lines.length);
+
+        // Content before insertion line
+        newContentLines = lines.slice(0, insertionLine);
+        // Insert markers and imports
+        newContentLines.push(markerStart);
+        newContentLines.push(newImportsContent);
+        newContentLines.push(markerEnd);
+        // Content after insertion line
+        newContentLines = newContentLines.concat(lines.slice(insertionLine));
       }
 
-      // Normalize multiple blank lines to at most two
-      const finalContent = newContentLines.join("\n").replace(/\n{3,}/g, "\n\n");
+      // FIX: Use '\n' for actual newline character in join and regex
+      const finalContent = newContentLines
+          .join('\n')
+          .replace(/\n{3,}/g, '\n\n'); // Normalize multiple newlines to max two
 
       fs.writeFileSync(stylesFilePath, finalContent, "utf8");
+      if (initialUpdate) {
+        log(`Initial update for "${effectiveMarkerId}" completed.`);
+      } else if (_isActive) {
+        log(`Styles file ${path.basename(stylesFilePath)} updated for "${effectiveMarkerId}".`);
+      }
     } catch (err) {
-      log(`❌ Error updating ${path.basename(stylesFilePath)}: ${err.message}`, "error");
+      log(`❌ Error updating styles file: ${err.message}`);
     }
   }
 
-
   function removeMarkers(deleteImports = false) {
-    // effectiveMarkerId is now from the outer scope
-    // stylesFilePath is also from the outer scope
-    // markerStart and markerEnd are also from the outer scope
+    if (!fs.existsSync(stylesFilePath)) {
+      log(`Styles file not found: ${stylesFilePath}`);
+      return;
+    }
 
     try {
-      const content = fs.readFileSync(stylesFilePath, "utf8");
-      const lines = content.split(/\r?\n/);
-      let newContentLines = []; // Changed from 'const' to 'let'
-      let inMarkerBlock = false;
-      let contentAfterMarkers = [];
+      let content = fs.readFileSync(stylesFilePath, "utf8");
+      // FIX: Use '\n' for actual newline character
+      const lines = content.split('\n');
 
+      let startIndex = -1;
+      let endIndex = -1;
+
+      // Find marker positions using the new format
       for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (line.includes(markerStart)) {
-          inMarkerBlock = true;
-          if (!deleteImports) {
-            // If not deleting imports, keep the start marker
-            newContentLines.push(line);
-          }
-          continue;
+        if (lines[i].includes(markerStart)) {
+          startIndex = i;
         }
-        if (line.includes(markerEnd)) {
-          inMarkerBlock = false;
-          if (!deleteImports) {
-            // If not deleting imports, keep the end marker
-            newContentLines.push(line);
-          }
-          // Capture content after the marker block to append later
-          contentAfterMarkers = lines.slice(i + 1);
-          break; // Stop processing lines within the loop
-        }
-        if (!inMarkerBlock) {
-          newContentLines.push(line);
+        if (lines[i].includes(markerEnd)) {
+          endIndex = i;
         }
       }
 
-      newContentLines = newContentLines.concat(contentAfterMarkers);
+      if (startIndex !== -1 && endIndex !== -1 && startIndex < endIndex) {
+        let newContentLines = lines.slice(0, startIndex);
+        if (!deleteImports) {
+          // If not deleting imports, find the content *between* the group markers
+          // and re-insert it, effectively just removing the start/end/group markers
+          let contentBetweenMarkers = [];
+          for (let i = startIndex + 1; i < endIndex; i++) {
+            const line = lines[i];
+            // Only keep lines that are NOT group markers
+            // FIX: Use '\n' for actual newline character
+            if (!line.includes(GROUP_MARKER_PREFIX) || !line.includes(GROUP_MARKER_SUFFIX)) {
+              contentBetweenMarkers.push(line);
+            }
+          }
+          newContentLines = newContentLines.concat(contentBetweenMarkers);
+        }
+        // FIX: Use '\n' for actual newline character
+        newContentLines = newContentLines.concat(lines.slice(endIndex + 1));
 
-      const finalContent = newContentLines
-          .join("\n")
-          .replace(/\n{3,}/g, "\n\n");
+        // FIX: Use '\n' for actual newline character
+        const finalContent = newContentLines
+            .join('\n')
+            .replace(/\n{3,}/g, '\n\n');
 
-      fs.writeFileSync(stylesFilePath, finalContent, "utf8");
-      log(
-          `✅ Removed markers ${deleteImports ? "and imports " : ""}for "${effectiveMarkerId}" from ${path.basename(stylesFilePath)}`
-      );
+        fs.writeFileSync(stylesFilePath, finalContent, "utf8");
+        log(
+            `✅ Removed markers ${deleteImports ? "and imports " : ""}for "${effectiveMarkerId}" from ${path.basename(stylesFilePath)}`,
+        );
+      } else {
+        // log(`Markers for "${effectiveMarkerId}" not found in ${path.basename(stylesFilePath)}. Nothing to remove.`);
+      }
     } catch (err) {
       log(
-          `❌ Error removing markers from ${path.basename(stylesFilePath)}: ${err.message}`
+          `❌ Error removing markers from ${path.basename(stylesFilePath)}: ${err.message}`,
       );
     }
   }
 
   const debouncedReactiveUpdate = debounce(() => updateStylesFile(false), 100);
 
-  const watcher = chokidar.watch(watchFolder, {
+  const watcher = chokidar.watch(watchDir, {
     persistent: true,
     ignoreInitial: true, // We call _initialUpdate manually
     depth: Infinity,
-    ignored: excludePaths, // Use excludePaths here
+    ignored: (options.excludePaths || []).map(p => path.resolve(rootDir, p)) // Pass absolute paths to chokidar's ignored option
   });
 
   watcher.on("add", debouncedReactiveUpdate);
@@ -277,7 +298,6 @@ function scssImportWatcher(options) {
   watcher.on("change", debouncedReactiveUpdate);
   watcher.on("addDir", debouncedReactiveUpdate);
   watcher.on("unlinkDir", debouncedReactiveUpdate);
-
 
   return {
     close: () => watcher.close(),
