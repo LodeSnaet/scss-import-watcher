@@ -54,8 +54,8 @@ function scssImportWatcher(options) {
     allWatchersConfigs = {} // All watcher configs passed from CLI
   } = options;
 
-  // Use the user-provided markerId, or default to the watchDir name if not provided
-  const effectiveMarkerId = userMarkerId || watchDir.replace(/[\/\\]/g, '_').replace(/^_/, ''); // Sanitize for marker if needed
+  // Use the user-provided markerId, or default to the basename of the watchDir
+  const effectiveMarkerId = userMarkerId || path.basename(watchDir).replace(/[\/\\]/g, '_').replace(/^_/, ''); // Sanitize for marker if needed
 
   const absoluteStylesFilePath = path.resolve(rootDir, stylesFile);
   const absoluteWatchDir = path.resolve(rootDir, watchDir);
@@ -231,12 +231,11 @@ function scssImportWatcher(options) {
 
       if (pathAfterWatchDir.includes('/')) {
         // If there's a subdirectory in the path after watchDir, the group key is the first subdirectory name.
-        // E.g., if watchDir is "test2", and pathAfterWatchDir is "hello/hellotest", groupKey is "hello".
         groupKey = pathAfterWatchDir.split('/')[0];
       } else {
         // If it's a direct file/folder import in the watchDir (e.g., "hello" from "test2/hello")
-        // or a partial directly in watchDir (e.g., "_base.scss"), it belongs to the "base" group.
-        groupKey = 'base';
+        // or a partial directly in watchDir (e.g., "_base.scss"), it belongs to the basename of the watchDir.
+        groupKey = path.basename(watchDir); // Use the basename of the current watcher's watchDir
       }
       log(`    Group Key: "${groupKey}"`);
 
