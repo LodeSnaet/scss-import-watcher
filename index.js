@@ -55,7 +55,7 @@ function scssImportWatcher(options) {
   } = options;
 
   // Use the user-provided markerId, or default to the basename of the watchDir
-  const effectiveMarkerId = userMarkerId || path.basename(watchDir).replace(/[\/\\]/g, '_').replace(/^_/, ''); // Sanitize for marker if needed
+  const effectiveMarkerId = userMarkerId || name;
 
   const absoluteStylesFilePath = path.resolve(rootDir, stylesFile);
   const absoluteWatchDir = path.resolve(rootDir, watchDir);

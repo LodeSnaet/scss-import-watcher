@@ -14,6 +14,7 @@ const watchers = new Map(); // key: name, value: { config: fullConfig, instance 
 // watcherConfigs object: Holds all persistent configurations loaded from/saved to the JSON file.
 // This is the source of truth for individual watcher settings.
 let watcherConfigs = {}; // key: name, value: { name, watchDir, line, excludePaths }
+let _watchersJsonPath = null;
 
 // Global project settings - these are considered singular for the project
 let _globalRootDir = null; // Determined once at startup by user input or loaded from JSON, stored as absolute path
@@ -27,46 +28,58 @@ const SAVE_DEBOUNCE_DELAY = 500; // milliseconds
 
 // Function to get the full path to the watchers.json file
 function getWatchersConfigPath() {
-  // watchers.json must always be in the _globalRootDir
-  if (!_globalRootDir) {
-    // This case should ideally not be hit if setupProjectRootAndStylesFile runs first
-    return path.join(process.cwd(), "watchers.json");
-  }
-  return path.join(_globalRootDir, "watchers.json");
+  return _watchersJsonPath || path.join(process.cwd(), "watchers.json");
+
 }
 
 /**
- * Synchronously saves configurations to file.
- * This is used when immediate consistency is required (e.g., before re-initializing watchers).
- * @param {boolean} [clearWatchers=false] - If true, clears the 'watchers' object in the saved config.
+ * Synchronously saves current in-memory configurations to file.
+ * This does NOT clear watcherConfigs.
  */
-function _saveConfigsSync(clearWatchers = false) {
+function _saveConfigsSync() {
   try {
     const configToSave = {
       _globalRootDir: _globalRootDir,
       _globalStylesFile: _globalStylesFile,
-      watchers: clearWatchers ? {} : watcherConfigs, // Clear if requested
+      watchers: watcherConfigs, // Always save the current state of watcherConfigs
     };
     const configPath = getWatchersConfigPath();
     fs.writeFileSync(configPath, JSON.stringify(configToSave, null, 2), "utf8");
-    console.log(`\n💾 Configs saved synchronously to ${path.basename(configPath)}.`);
+    // console.log(`\n💾 Configs saved synchronously to ${path.basename(configPath)}.`); // Commented for less clutter
   } catch (error) {
     console.error(`\n❌ Error saving configuration synchronously: ${error.message}`);
   }
 }
 
 /**
- * Debounced function to save configurations.
+ * Saves configurations to file with a debounce.
  * Used for general CLI operations where immediate write is not critical.
- * @param {boolean} [clearWatchers=false] - If true, clears the 'watchers' object in the saved config.
  */
-function saveConfigs(clearWatchers = false) {
+function saveConfigs() {
   if (saveTimeout) {
     clearTimeout(saveTimeout);
   }
   saveTimeout = setTimeout(() => {
-    _saveConfigsSync(clearWatchers);
+    _saveConfigsSync(); // Call the non-clearing sync save
   }, SAVE_DEBOUNCE_DELAY);
+}
+
+/**
+ * New function specifically for saving on exit/SIGINT, which clears all watchers.
+ */
+function _saveConfigsOnExit() {
+  try {
+    const configToSave = {
+      _globalRootDir: _globalRootDir,
+      _globalStylesFile: _globalStylesFile,
+      watchers: {}, // Clear watchers when saving on exit
+    };
+    const configPath = getWatchersConfigPath();
+    fs.writeFileSync(configPath, JSON.stringify(configToSave, null, 2), "utf8");
+    console.log(`\n💾 Configs cleared and saved synchronously to ${path.basename(configPath)} on exit.`);
+  } catch (error) {
+    console.error(`\n❌ Error saving configuration synchronously on exit: ${error.message}`);
+  }
 }
 
 
@@ -81,9 +94,8 @@ function loadConfigs() {
       watcherConfigs = config.watchers || {};
       console.log(`\n⚙️ Loaded configurations from ${path.basename(configPath)}.`);
 
-      // Start watching the config file itself for external changes
+      // Start watching the config file itself for external changes immediately after loading
       startWatchingConfigFile();
-
       return true;
     } catch (error) {
       console.error(`\n❌ Error loading configuration from ${path.basename(configPath)}: ${error.message}`);
@@ -95,22 +107,28 @@ function loadConfigs() {
 
 // Function to start watching the config file
 function startWatchingConfigFile() {
+  console.log(`👀 Watching config file: ${configPath}`);
+
   if (configFileWatcher) {
     configFileWatcher.close(); // Close existing watcher if any
   }
   const configPath = getWatchersConfigPath();
   if (!fs.existsSync(configPath)) {
-    // If config file doesn't exist yet, we can't watch it. It's created on save.
+    // If config file doesn't exist yet, we can't watch it. It's created on first save.
     return;
   }
 
   configFileWatcher = chokidar.watch(configPath, {
     persistent: true,
-    ignoreInitial: true,
+    ignoreInitial: true, // Don't trigger 'change' on startup load
+    usePolling: true,
+    interval: 300,
     depth: 0, // Only watch the file itself
   });
 
   configFileWatcher.on('change', () => {
+    console.log('📣 Detected watchers.json file change');
+
     handleExternalConfigChange();
   });
   configFileWatcher.on('error', (error) => {
@@ -122,49 +140,45 @@ function startWatchingConfigFile() {
 async function handleExternalConfigChange() {
   console.log(`\n🔄 Config file ${path.basename(getWatchersConfigPath())} changed externally. Checking for updates...`);
 
-  // Store current global settings and watcher configurations before attempting to load new ones
+  // Store current global settings and watcher configurations BEFORE attempting to load new ones
   const oldGlobalRootDir = _globalRootDir;
   const oldGlobalStylesFile = _globalStylesFile;
-  const oldWatcherConfigs = JSON.parse(JSON.stringify(watcherConfigs)); // Deep copy for accurate comparison later
+  const oldWatcherConfigsSnapshot = JSON.parse(JSON.stringify(watcherConfigs)); // Deep copy for comparison
 
-  // Temporarily stop all current watchers before reloading configs
-  console.log("  Beginning process to stop all active watchers and clear their markers from styles file.");
-  for (const [name, { instance }] of watchers) {
-    if (instance) {
-      console.log(`  Stopping active watcher "${name}" and removing its markers...`);
-      instance.removeMarkers(true); // Clean up old markers AND their contents before closing
-      instance.close();
-      console.log(`  Watcher "${name}" instance closed.`);
-    }
-    watchers.delete(name); // Ensure it's removed from the active map
+  // Temporarily close the config file watcher to prevent recursive triggers during reloads/saves
+  if (configFileWatcher) {
+    configFileWatcher.close();
+    configFileWatcher = null; // Mark as closed
   }
-  watchers.clear(); // Clear the map of active watchers
-  console.log("  All active watchers temporarily stopped. styles.scss should now be free of old watcher markers.");
 
-  // Reload configurations from file
+  // Reload configurations from file. This updates global state (_globalRootDir, _globalStylesFile, watcherConfigs).
   console.log("  Attempting to reload configurations from watchers.json...");
-  const configLoaded = loadConfigs(); // This updates _globalRootDir, _globalStylesFile, watcherConfigs
-  if (!configLoaded) {
-    console.log("  Failed to reload configurations from file. Attempting to revert to previous settings and re-initialize.");
-    // Revert to old configs if loading failed completely
+  const configLoadedSuccessfully = loadConfigs(); // This implicitly calls startWatchingConfigFile if successful
+
+  if (!configLoadedSuccessfully) {
+    console.error("  Failed to reload configurations from file. Reverting to previous state and re-initializing all watchers.");
+    // Revert global settings and watcher configs to their previous state
     _globalRootDir = oldGlobalRootDir;
     _globalStylesFile = oldGlobalStylesFile;
-    watcherConfigs = oldWatcherConfigs; // Restore old watcher configurations
-    _saveConfigsSync(); // Immediately save the reverted state to overwrite the bad external change
-    for (const name in watcherConfigs) {
+    watcherConfigs = oldWatcherConfigsSnapshot;
+    _saveConfigsSync(); // Overwrite the problematic external change with the valid old state
+    // Re-initialize all watchers based on the restored previous state
+    // First, clear all existing active instances from the map
+    for (const [name, { instance }] of watchers) {
+      if (instance) instance.close();
+    }
+    watchers.clear();
+    for (const name in watcherConfigs) { // Use the reverted watcherConfigs
       await loadAndInitializeWatcher(name);
     }
-    console.log("  Previous configurations restored. Watchers re-initialized.");
+    console.log("  Previous configurations restored and watchers re-initialized.");
+    startWatchingConfigFile(); // Restart watching the config file
     return;
   }
-  console.log("  Configurations successfully reloaded.");
-
+  console.log("  Configurations successfully reloaded from file.");
 
   let globalSettingsChanged = false;
-  if (_globalRootDir !== oldGlobalRootDir) {
-    globalSettingsChanged = true;
-  }
-  if (_globalStylesFile !== oldGlobalStylesFile) {
+  if (_globalRootDir !== oldGlobalRootDir || _globalStylesFile !== oldGlobalStylesFile) {
     globalSettingsChanged = true;
   }
 
@@ -177,7 +191,7 @@ async function handleExternalConfigChange() {
       {
         type: 'confirm',
         name: 'confirmGlobalUpdate',
-        message: 'Do you want to apply these global changes? (Choosing No will revert to previous settings)',
+        message: 'Do you want to apply these global changes? (Choosing No will revert to previous settings and re-initialize ALL watchers based on old settings)',
         default: true,
       },
     ]);
@@ -186,66 +200,218 @@ async function handleExternalConfigChange() {
       console.log("  Global settings update cancelled. Reverting to previous settings.");
       _globalRootDir = oldGlobalRootDir;
       _globalStylesFile = oldGlobalStylesFile;
-      watcherConfigs = oldWatcherConfigs; // Revert all watcher configs too as their paths might depend on global root
-      _saveConfigsSync(); // Immediately save the reverted state to overwrite the external change
-      console.log("  Previous global settings restored.");
+      watcherConfigs = oldWatcherConfigsSnapshot; // Revert all watcher configs too
+      _saveConfigsSync(); // Immediately save the reverted state to overwrite the bad external change
     } else {
       console.log("  Applying new global settings.");
-      _saveConfigsSync(); // Immediately save the new global settings
+      // No need to _saveConfigsSync here because loadConfigs already did it if successful
     }
-  } else {
-    console.log("  No changes in global settings detected. Proceeding to re-initialize individual watchers.");
-  }
-
-  // Determine which specific watcher configs changed to provide more granular messages
-  for (const newWatcherName in watcherConfigs) {
-    const oldWatcherConfig = oldWatcherConfigs[newWatcherName];
-    const newWatcherConfig = watcherConfigs[newWatcherName];
-
-    if (!oldWatcherConfig) {
-      console.log(`\n➕ New watcher "${newWatcherName}" detected.`);
-      // No need to re-initialize here, handled in the next loop.
-    } else {
-      // Compare properties to identify specific changes
-      const changes = [];
-      if (oldWatcherConfig.watchDir !== newWatcherConfig.watchDir) {
-        changes.push(`watchDir: "${oldWatcherConfig.watchDir}" -> "${newWatcherConfig.watchDir}"`);
-      }
-      if (oldWatcherConfig.line !== newWatcherConfig.line) {
-        changes.push(`line: ${oldWatcherConfig.line} -> ${newWatcherConfig.line}`);
-      }
-      if (oldWatcherConfig.markerId !== newWatcherConfig.markerId) {
-        changes.push(`markerId: "${oldWatcherConfig.markerId || 'auto'}" -> "${newWatcherConfig.markerId || 'auto'}"`);
-      }
-      // Shallow comparison for excludePaths array content
-      if (JSON.stringify(oldWatcherConfig.excludePaths) !== JSON.stringify(newWatcherConfig.excludePaths)) {
-        changes.push(`excludePaths: [${oldWatcherConfig.excludePaths.join(', ')}] -> [${newWatcherConfig.excludePaths.join(', ')}]`);
-      }
-
-      if (changes.length > 0) {
-        console.log(`\n✏️ Watcher "${newWatcherName}" updated:`);
-        changes.forEach(change => console.log(`    - ${change}`));
+    // In either case (confirmed or reverted global change), perform a full re-initialization of ALL watchers.
+    // This is because changing global root/styles file fundamentally alters how all watchers operate.
+    console.log("  Performing full re-initialization of all watchers due to global settings changes.");
+    // Clear all existing active instances and their markers
+    for (const [name, { instance }] of watchers) {
+      if (instance) {
+        console.log(`  Stopping active watcher "${name}" and removing its markers...`);
+        instance.removeMarkers(true); // Remove specific watcher's markers
+        instance.close();
       }
     }
+    watchers.clear(); // Clear all active instances from the map
+
+    // Now, initialize all watchers based on the current (potentially new or reverted) global and watcher configs
+    for (const name in watcherConfigs) {
+      await loadAndInitializeWatcher(name);
+    }
+    console.log("  All watchers re-initialized.");
+    startWatchingConfigFile(); // Restart watching the config file
+    return; // Exit after handling global change and full re-init
   }
 
-  // Check for deleted watchers
-  for (const oldWatcherName in oldWatcherConfigs) {
-    if (!watcherConfigs[oldWatcherName]) {
-      console.log(`\n🗑️ Watcher "${oldWatcherName}" deleted.`);
+  // If no global settings changed, proceed with granular watcher updates
+  console.log("  No changes in global settings detected. Proceeding to update individual watchers.");
+
+  const newWatcherNames = Object.keys(watcherConfigs);
+  const oldWatcherNames = Object.keys(oldWatcherConfigsSnapshot);
+
+  // Identify added, modified, deleted, and unchanged watchers
+  const addedWatchers = newWatcherNames.filter(name => !oldWatcherNames.includes(name));
+  const deletedWatchers = oldWatcherNames.filter(name => !newWatcherNames.includes(name));
+  const modifiedWatchers = newWatcherNames.filter(name => {
+    if (!oldWatcherNames.includes(name)) return false; // Not a modification, it's an addition
+    const oldConfig = oldWatcherConfigsSnapshot[name];
+    const newConfig = watcherConfigs[name]; // This is the already loaded new config
+    // Perform a deep comparison of properties
+    return JSON.stringify(oldConfig) !== JSON.stringify(newConfig);
+  });
+  const unchangedWatchers = newWatcherNames.filter(name =>
+      !addedWatchers.includes(name) && !modifiedWatchers.includes(name)
+  );
+
+
+  // --- Step 1: Process Deleted Watchers ---
+  console.log("\n  Processing deleted watchers...");
+  for (const name of deletedWatchers) {
+    console.log(`  🗑️ Watcher "${name}" deleted.`);
+    const watcherData = watchers.get(name);
+    if (watcherData && watcherData.instance) {
+      console.log(`    Cleaning up markers for "${name}"...`);
+      watcherData.instance.removeMarkers(true); // Remove specific watcher's markers
+      watcherData.instance.close(); // Close its instance
+      watchers.delete(name); // Remove from active map
+    }
+    // No need to delete from `watcherConfigs` here, as `loadConfigs` already reflects the new state.
+
+    // Remove this watcher's path from other watchers' excludePaths if it was there
+    const deletedWatcherRelativeWatchDir = oldWatcherConfigsSnapshot[name]?.watchDir;
+    if (deletedWatcherRelativeWatchDir) {
+      // Iterate through the *current* state of watchers (which now exclude the deleted one)
+      for (const otherWatcherName of Object.keys(watcherConfigs)) {
+        const otherWatcherConfig = watcherConfigs[otherWatcherName]; // Use the currently loaded config
+        const updatedExcludePaths = new Set(otherWatcherConfig.excludePaths);
+        if (updatedExcludePaths.has(deletedWatcherRelativeWatchDir)) {
+          updatedExcludePaths.delete(deletedWatcherRelativeWatchDir);
+          otherWatcherConfig.excludePaths = Array.from(updatedExcludePaths);
+          console.log(`    🔄 Removed "${deletedWatcherRelativeWatchDir}" from excludePaths of "${otherWatcherName}".`);
+          _saveConfigsSync(); // Save the in-memory change
+          // Re-initialize this other watcher to apply the updated excludePaths
+          const otherWatcherInstance = watchers.get(otherWatcherName)?.instance;
+          if (otherWatcherInstance) { // Only if it's currently active (might not be if it was also modified/deleted)
+            console.log(`    Re-initializing "${otherWatcherName}" to apply excludePaths update...`);
+            otherWatcherInstance.removeMarkers(true); // Clean old markers (if it had any)
+            otherWatcherInstance.close();
+            watchers.delete(otherWatcherName);
+          }
+          // Always call loadAndInitializeWatcher to ensure it's running with the latest config
+          await loadAndInitializeWatcher(otherWatcherName);
+        }
+      }
     }
   }
 
 
-  // Re-initialize all watchers based on the (potentially reverted or new) reloaded config
-  // This loop will create new instances and update the styles file accordingly.
-  console.log("\n  Starting re-initialization of all watchers based on current configuration...");
-  for (const name in watcherConfigs) {
-    console.log(`  Re-initializing watcher "${name}"...`);
-    await loadAndInitializeWatcher(name); // Use await here
+  // --- Step 2: Process Modified Watchers ---
+  console.log("\n  Processing modified watchers...");
+  for (const name of modifiedWatchers) {
+    console.log(`  ✏️ Watcher "${name}" modified.`);
+    const oldConfig = oldWatcherConfigsSnapshot[name];
+    const newConfig = watcherConfigs[name];
+
+    // Log specific changes for better user feedback
+    const changes = [];
+    if (oldConfig.watchDir !== newConfig.watchDir) changes.push(`watchDir: "${oldConfig.watchDir}" -> "${newConfig.watchDir}"`);
+    if (oldConfig.line !== newConfig.line) changes.push(`line: ${oldConfig.line} -> ${newConfig.line}`);
+    if ((oldConfig.markerId || 'auto') !== (newConfig.markerId || 'auto')) changes.push(`markerId: "${oldConfig.markerId || 'auto'}" -> "${newConfig.markerId || 'auto'}"`);
+    if (JSON.stringify(oldConfig.excludePaths) !== JSON.stringify(newConfig.excludePaths)) changes.push(`excludePaths changed`);
+    changes.forEach(change => console.log(`    - ${change}`));
+
+    // Close and remove existing instance, clean its old markers
+    const watcherData = watchers.get(name);
+    if (watcherData && watcherData.instance) {
+      console.log(`    Cleaning up old markers for "${name}" before re-init...`);
+      watcherData.instance.removeMarkers(true);
+      watcherData.instance.close();
+      watchers.delete(name);
+    }
+
+    // Re-initialize the modified watcher
+    await loadAndInitializeWatcher(name);
+
+    // If watchDir changed, re-evaluate exclusions for other watchers
+    if (oldConfig.watchDir !== newConfig.watchDir) {
+      console.log(`    Watch directory changed for "${name}". Re-evaluating exclusions for other watchers.`);
+      // Iterate through the *current* state of watchers (excluding the one just modified)
+      for (const otherWatcherName of Object.keys(watcherConfigs).filter(n => n !== name)) {
+        const otherWatcherConfig = watcherConfigs[otherWatcherName];
+        const updatedExcludePathsSet = new Set(otherWatcherConfig.excludePaths);
+        let shouldUpdateOtherWatcher = false;
+
+        const otherWatcherWatchDirAbsolute = path.resolve(_globalRootDir, otherWatcherConfig.watchDir);
+        const oldWatcherWatchDirAbsolute = path.resolve(_globalRootDir, oldConfig.watchDir);
+        const newWatcherWatchDirAbsolute = path.resolve(_globalRootDir, newConfig.watchDir);
+
+        // Logic for removing old watchDir if it was a child
+        const wasOtherParentOfOld = !path.relative(otherWatcherWatchDirAbsolute, oldWatcherWatchDirAbsolute).startsWith('..');
+        // Check if the old watchDir *was* in the other watcher's exclusions and needs to be removed
+        if (wasOtherParentOfOld && updatedExcludePathsSet.has(oldConfig.watchDir)) {
+          updatedExcludePathsSet.delete(oldConfig.watchDir);
+          shouldUpdateOtherWatcher = true;
+          console.log(`    Removing old watchDir "${oldConfig.watchDir}" from excludePaths of "${otherWatcherName}".`);
+        }
+
+        // Logic for adding new watchDir if it is now a child
+        const isOtherParentOfNew = !path.relative(otherWatcherWatchDirAbsolute, newWatcherWatchDirAbsolute).startsWith('..');
+        // Check if the new watchDir *should* be in the other watcher's exclusions and isn't yet
+        if (isOtherParentOfNew && !updatedExcludePathsSet.has(newConfig.watchDir)) {
+          updatedExcludePathsSet.add(newConfig.watchDir);
+          shouldUpdateOtherWatcher = true;
+          console.log(`    Adding new watchDir "${newConfig.watchDir}" to excludePaths of "${otherWatcherName}".`);
+        }
+
+        if (shouldUpdateOtherWatcher) {
+          otherWatcherConfig.excludePaths = Array.from(updatedExcludePathsSet);
+          _saveConfigsSync(); // Save the in-memory change
+          // Re-initialize this other watcher to apply the updated excludePaths
+          const otherWatcherInstance = watchers.get(otherWatcherName)?.instance;
+          if (otherWatcherInstance) { // Only if it's currently active
+            console.log(`    Re-initializing "${otherWatcherName}" to apply excludePaths update...`);
+            otherWatcherInstance.removeMarkers(true);
+            otherWatcherInstance.close();
+            watchers.delete(otherWatcherName);
+          }
+          // Always call loadAndInitializeWatcher to ensure it's running with the latest config
+          await loadAndInitializeWatcher(otherWatcherName);
+        }
+      }
+    }
   }
-  console.log("✅ All watchers reloaded and reinitialized based on the current configuration.");
+
+  // --- Step 3: Process Added Watchers ---
+  console.log("\n  Processing added watchers...");
+  for (const name of addedWatchers) {
+    console.log(`  ➕ New watcher "${name}" detected.`);
+    // Initialize the new watcher
+    await loadAndInitializeWatcher(name);
+
+    // Update parent watchers' excludePaths
+    const newWatcherRelativeWatchDir = watcherConfigs[name].watchDir;
+    // Iterate through the *current* state of watchers (excluding the one just added)
+    for (const otherWatcherName of Object.keys(watcherConfigs).filter(n => n !== name)) {
+      const otherWatcherConfig = watcherConfigs[otherWatcherName];
+      const otherWatcherWatchDirAbsolute = path.resolve(_globalRootDir, otherWatcherConfig.watchDir);
+      const newWatcherWatchDirAbsolute = path.resolve(_globalRootDir, newWatcherRelativeWatchDir);
+
+      const isOtherParentOfNew = !path.relative(otherWatcherWatchDirAbsolute, newWatcherWatchDirAbsolute).startsWith('..');
+
+      if (isOtherParentOfNew) {
+        const updatedExcludePaths = new Set(otherWatcherConfig.excludePaths);
+        if (!updatedExcludePaths.has(newWatcherRelativeWatchDir)) {
+          updatedExcludePaths.add(newWatcherRelativeWatchDir);
+          otherWatcherConfig.excludePaths = Array.from(updatedExcludePaths);
+          console.log(`    🔄 Updated excludePaths for "${otherWatcherName}" to include new watcher "${newWatcherRelativeWatchDir}".`);
+          _saveConfigsSync(); // Save the in-memory change
+          // Re-initialize this other watcher to apply the updated excludePaths
+          const otherWatcherInstance = watchers.get(otherWatcherName)?.instance;
+          if (otherWatcherInstance) { // Only if it's currently active
+            console.log(`    Re-initializing "${otherWatcherName}" to apply excludePaths update...`);
+            otherWatcherInstance.removeMarkers(true);
+            otherWatcherInstance.close();
+            watchers.delete(otherWatcherName);
+          }
+          // Always call loadAndInitializeWatcher to ensure it's running with the latest config
+          await loadAndInitializeWatcher(otherWatcherName);
+        }
+      }
+    }
+  }
+
+  // If we reached this point, it means no global settings change led to a full restart.
+  // Unchanged watchers were left running. Modified/added watchers were restarted. Deleted ones were cleaned up.
+  console.log("✅ Watcher configurations synchronized. Unchanged watchers remain active.");
+
+  startWatchingConfigFile(); // Restart watching the config file after all operations
 }
+
 
 // Helper to list folders and files in a directory
 function listFoldersAndFiles(dir) {
@@ -322,7 +488,7 @@ async function browseForDirectory(startDir, message, isRootRestricted = false, r
   }
 }
 
-// NEW FUNCTION: Browse for a specific file (e.g., watchers.json)
+// NEW FUNCTION: Browse for a specific file (e.g., watchers.json) - (Not currently used but good to have)
 async function browseForFile(startDir, message, fileExtension = '', fileNameOnly = null) {
   let current = startDir;
   while (true) {
@@ -448,13 +614,13 @@ async function loadAndInitializeWatcher(name) {
     return;
   }
 
-  // Ensure rootDir and stylesFile are always absolute paths
+  // Ensure rootDir and stylesFile are always absolute paths in the passed config
   const fullConfig = {
     ...config,
     rootDir: _globalRootDir, // This is always absolute from loadConfigs
     stylesFile: _globalStylesFile, // This is relative to _globalRootDir
     // NEW: Pass the entire watcherConfigs for cross-watcher filtering
-    allWatchersConfigs: watcherConfigs
+    allWatchersConfigs: watcherConfigs // Pass the live, potentially updated watcherConfigs
   };
 
   try {
@@ -477,120 +643,110 @@ async function loadAndInitializeWatcher(name) {
 // Initial setup for _globalRootDir and _globalStylesFile
 async function setupProjectRootAndStylesFile() {
   console.log("\n--- Initial Project Setup ---");
-  console.log("This tool needs to know your main project root and where your primary SCSS file is located.");
+  console.log("This tool needs to know your main project root, your primary SCSS file, and your watchers.json file.");
 
-  let currentWorkingDir = process.cwd(); // The initial directory where the CLI was launched
+  let currentWorkingDir = process.cwd();
+  let rootDirSelected = false;
 
   // Step 1: Select Project Root
-  let rootDirSelected = false;
   while (!rootDirSelected) {
     const rootDirAbsolute = await browseForDirectory(
-        currentWorkingDir, // Start browsing from current working directory
+        currentWorkingDir,
         "Select your main project root directory:",
-        true, // isRootRestricted = true (prevents going up past rootUpperBound)
-        currentWorkingDir // rootUpperBound is process.cwd()
+        true,
+        currentWorkingDir
     );
 
     if (!rootDirAbsolute) {
       console.log("Project root selection cancelled. Cannot proceed.");
       process.exit(0);
     }
+
     _globalRootDir = rootDirAbsolute;
     rootDirSelected = true;
   }
 
-  // Step 2: Offer to Load watchers.json from the selected root
-  console.log(`\nChecking for existing watchers.json in: ${_globalRootDir}`);
-  const existingWatchersJsonPath = path.join(_globalRootDir, "watchers.json");
+  // Step 2: Select Main SCSS File
+  let stylesFileSelected = false;
+  while (!stylesFileSelected) {
+    console.log(`\nNow, select your primary SCSS file (e.g., main.scss, app.scss). It must be directly in: ${_globalRootDir}`);
+    const stylesFileAbsolute = await browseForScssFileInDirectory(
+        _globalRootDir,
+        "Select your main SCSS file to be updated (must be in the project root):"
+    );
 
-  let loadedSuccessfully = false;
-  let finalSetupDecisionMade = false;
-
-  if (fs.existsSync(existingWatchersJsonPath)) {
-    const { confirmLoad } = await inquirer.prompt({
-      type: "confirm",
-      name: "confirmLoad",
-      message: `Found an existing watchers.json at "${path.basename(existingWatchersJsonPath)}". Load configurations from it?`,
-      default: true,
-    });
-
-    if (confirmLoad) {
-      try {
-        const config = JSON.parse(fs.readFileSync(existingWatchersJsonPath, "utf8"));
-        const loadedRootDir = config._globalRootDir;
-        const loadedStylesFile = config._globalStylesFile;
-        const loadedWatchers = config.watchers || {};
-
-        let isValidLoad = true;
-        if (!loadedRootDir || !loadedStylesFile) {
-          console.error(`\n❌ Error: Selected watchers.json is missing required global settings (_globalRootDir or _globalStylesFile).`);
-          isValidLoad = false;
-        } else if (loadedRootDir !== _globalRootDir) {
-          // If the root dir in JSON doesn't match the one just selected, warn but allow
-          console.warn(`\n⚠️ Warning: _globalRootDir in selected watchers.json ("${loadedRootDir}") does not match the chosen project root ("${_globalRootDir}").`);
-          const { confirmRootMismatch } = await inquirer.prompt({
-            type: "confirm",
-            name: "confirmRootMismatch",
-            message: "Do you want to proceed with the project root you just selected, and use the watchers.json's other settings (this will overwrite _globalRootDir in the file)?",
-            default: true
-          });
-          if (!confirmRootMismatch) {
-            isValidLoad = false;
-          }
-        }
-
-        if (isValidLoad) {
-          // Keep the _globalRootDir that the user selected
-          // Update _globalStylesFile and watcherConfigs from the loaded JSON
-          _globalStylesFile = loadedStylesFile;
-          watcherConfigs = loadedWatchers;
-          _saveConfigsSync(); // Persist the potentially updated config (especially if root mismatch was handled)
-          console.log(`\n✅ Configuration loaded from ${path.basename(existingWatchersJsonPath)}.`);
-          loadedSuccessfully = true;
-        } else {
-          console.log("Skipping loading due to validation issues or user cancellation.");
-        }
-      } catch (error) {
-        console.error(`\n❌ Error loading or parsing watchers.json: ${error.message}`);
-      }
+    if (stylesFileAbsolute === 'RETRY_SELECTION') {
+      continue;
     }
+
+    if (!stylesFileAbsolute) {
+      console.log("Main SCSS file selection cancelled. Cannot proceed.");
+      process.exit(0);
+    }
+
+    _globalStylesFile = path.relative(_globalRootDir, stylesFileAbsolute);
+    if (!_globalStylesFile.endsWith('.scss')) {
+      console.warn("⚠️ Warning: The selected file does not have a .scss extension. Ensure it's a valid SCSS file.");
+    }
+
+    stylesFileSelected = true;
+  }
+
+  // Step 3: Select watchers.json in root only (no folder browsing)
+  console.log(`\nLooking for .json files in: ${_globalRootDir}`);
+  const entries = fs.readdirSync(_globalRootDir, { withFileTypes: true });
+  const jsonFiles = entries
+      .filter(e => e.isFile() && e.name.endsWith('.json'))
+      .map(e => e.name);
+
+  if (jsonFiles.length === 0) {
+    console.log("❌ No JSON files found in the selected root directory.");
+    process.exit(1);
+  }
+
+  const { selectedJson } = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'selectedJson',
+      message: 'Select a watchers.json file from the root (no folders allowed):',
+      choices: jsonFiles
+    }
+  ]);
+
+  _watchersJsonPath = path.join(_globalRootDir, selectedJson);
+  console.log(`📄 Selected config: ${_watchersJsonPath}`);
+
+  // Step 4: Load Config
+  let loadedSuccessfully = false;
+
+  try {
+    const config = JSON.parse(fs.readFileSync(_watchersJsonPath, "utf8"));
+    const loadedRootDir = config._globalRootDir;
+    const loadedStylesFile = config._globalStylesFile;
+    const loadedWatchers = config.watchers || {};
+
+    if (!loadedRootDir || !loadedStylesFile) {
+      console.error("\n❌ The selected watchers.json file is missing required global settings.");
+    } else {
+      watcherConfigs = loadedWatchers;
+      console.log("✅ Loaded watcher configurations from file.");
+      loadedSuccessfully = true;
+    }
+  } catch (error) {
+    console.error(`\n❌ Failed to load or parse selected watchers.json: ${error.message}`);
   }
 
   if (!loadedSuccessfully) {
-    console.log("\nNo existing watchers.json loaded or user opted for new setup. Setting up new project settings.");
-    // Ensure watchers.json is created (or overwritten if invalid/declined) as empty for the new setup
-    _saveConfigsSync(true); // Clear watchers object in config file
-
-    // Step 3: Select Main SCSS File (only if not loaded from JSON)
-    let stylesFileSelected = false;
-    while (!stylesFileSelected) {
-      console.log(`\nNow, select your primary SCSS file (e.g., main.scss, app.scss). It must be directly in: ${_globalRootDir}`);
-      const stylesFileAbsolute = await browseForScssFileInDirectory( // Use the new function for root-only files
-          _globalRootDir, // Pass the global root dir directly
-          "Select your main SCSS file to be updated (must be in the project root):"
-      );
-
-      if (stylesFileAbsolute === 'RETRY_SELECTION') {
-        // User wants to retry file selection in the *same* _globalRootDir
-        continue;
-      }
-      if (!stylesFileAbsolute) {
-        console.log("Main SCSS file selection cancelled. Cannot proceed.");
-        process.exit(0);
-      }
-      _globalStylesFile = path.relative(_globalRootDir, stylesFileAbsolute);
-      if (!_globalStylesFile.endsWith('.scss')) {
-        console.warn("⚠️ Warning: The selected file does not have a .scss extension. Ensure it's a valid SCSS file.");
-      }
-      stylesFileSelected = true;
-    }
-    _saveConfigsSync(); // Save the newly defined global styles file
+    watcherConfigs = {};
+    console.warn("⚠️ Starting with empty watcher configuration.");
+    _saveConfigsSync();
   }
 
-  // Final summary and confirmation
+  // Final Confirmation
   console.log(`\n--- Project Settings Summary ---`);
   console.log(`📁 Project Root Set: ${_globalRootDir}`);
   console.log(`📄 Global Styles File Set: ${path.join(path.basename(_globalRootDir), _globalStylesFile)}`);
+  console.log(`📜 Config File: ${_watchersJsonPath}`);
 
   const { continueSetup } = await inquirer.prompt({
     type: "confirm",
@@ -701,7 +857,7 @@ async function createWatcherFlow() {
       if (updatedExcludePaths.size > existingWatcherConfig.excludePaths.length) {
         existingWatcherConfig.excludePaths = Array.from(updatedExcludePaths);
         console.log(`\n🔄 Updated excludePaths for existing watcher "${existingWatcherName}" to include "${newWatcherWatchDirRelative}".`);
-
+        _saveConfigsSync(); // Save the in-memory change
         // Re-initialize the parent watcher to apply the new excludePaths
         // This will also trigger removeMarkers(true) on the old instance and then regenerate imports
         const existingInstance = watchers.get(existingWatcherName)?.instance;
@@ -845,6 +1001,10 @@ async function editWatcherFlow(watcherName) {
   console.log(`\n--- Editing Watcher: ${watcherName} ---`);
   console.log(`(Press Enter to keep current value)`);
 
+  // Store the old watchDir before updating for comparison later
+  const oldWatchDirRelative = config.watchDir;
+  const oldConfigSnapshot = JSON.parse(JSON.stringify(config)); // Deep copy for comparison
+
   // Prompt for new watchDir
   const currentWatchDirAbsolute = path.resolve(_globalRootDir, config.watchDir);
   const newWatchDirAbsolute = await browseForDirectory(
@@ -907,20 +1067,39 @@ async function editWatcherFlow(watcherName) {
     );
   }
 
-  // Store the old watchDir before updating for comparison later
-  const oldWatchDirRelative = config.watchDir;
-
-  // Update configuration object
+  // Update configuration object in memory
   config.watchDir = newWatchDirRelative;
   config.line = newLine;
   config.markerId = newMarkerId;
   config.excludePaths = newExcludePaths;
 
-  _saveConfigsSync(); // Immediately save the updated watcher config
+  _saveConfigsSync(); // Immediately save the updated watcher config to watchers.json
 
   console.log(`\n✅ Watcher "${watcherName}" configuration updated and saved.`);
 
-  // If the watch directory changed, we might need to re-evaluate exclusions for other watchers
+  // If the watcher's config actually changed, re-initialize it
+  if (JSON.stringify(oldConfigSnapshot) !== JSON.stringify(config)) {
+    console.log(`\nWatcher "${watcherName}" configuration changed. Re-initializing...`);
+
+    // Clean up old markers for the currently edited watcher
+    const existingInstance = watchers.get(watcherName)?.instance;
+    if (existingInstance) {
+      console.log(`  Cleaning up old markers for "${watcherName}" before re-init...`);
+      existingInstance.removeMarkers(true); // Clean up old markers AND their content
+      existingInstance.close(); // Close old watcher instance
+      watchers.delete(watcherName); // Remove old instance from map
+      console.log(`  Old instance for "${watcherName}" cleaned and removed.`);
+    }
+
+    // Load and initialize the watcher with the new configuration
+    await loadAndInitializeWatcher(watcherName);
+    console.log(`\nWatcher "${watcherName}" reinitialized with new settings.`);
+  } else {
+    console.log(`\nNo changes detected for "${watcherName}". No re-initialization needed.`);
+  }
+
+  // Regardless of whether the current watcher was modified, if its watchDir changed,
+  // we might need to re-evaluate exclusions for other watchers.
   if (oldWatchDirRelative !== newWatchDirRelative) {
     console.log(`\nWatch directory for "${watcherName}" changed. Re-evaluating exclusions for all other watchers...`);
     // Re-evaluate and re-initialize all other watchers to update their exclusion lists
@@ -930,42 +1109,26 @@ async function editWatcherFlow(watcherName) {
       const otherWatcherConfig = watcherConfigs[nameOfOtherWatcher];
       const otherWatcherWatchDirAbsolute = path.resolve(_globalRootDir, otherWatcherConfig.watchDir);
 
-      // Check if this other watcher is a parent of the *new* watchDir
-      const relativePathFromOtherToNew = path.relative(otherWatcherWatchDirAbsolute, newWatchDirAbsolute);
-      const isOtherParentOfNew = !relativePathFromOtherToNew.startsWith('..') && relativePathFromOtherToNew !== '';
+      const updatedExcludePathsSet = new Set(otherWatcherConfig.excludePaths);
+      let shouldUpdateOtherWatcher = false;
 
-      // Check if this other watcher was a parent of the *old* watchDir
+      // Check if the old watchDir of the current watcher was a child of this other watcher
       const relativePathFromOtherToOld = path.relative(otherWatcherWatchDirAbsolute, path.resolve(_globalRootDir, oldWatchDirRelative));
       const isOtherParentOfOld = !relativePathFromOtherToOld.startsWith('..') && relativePathFromOtherToOld !== '';
-
-      let shouldUpdateOtherWatcher = false;
-      const updatedExcludePathsSet = new Set(otherWatcherConfig.excludePaths);
-
-      if (isOtherParentOfNew) {
-        // If other watcher is now a parent of the new watchDir, ensure the new watchDir is excluded
-        if (!updatedExcludePathsSet.has(newWatchDirRelative)) {
-          updatedExcludePathsSet.add(newWatchDirRelative);
-          shouldUpdateOtherWatcher = true;
-          console.log(`  Adding "${newWatchDirRelative}" to excludePaths of "${nameOfOtherWatcher}".`);
-        }
-      } else {
-        // If other watcher is NOT a parent of the new watchDir, ensure the new watchDir is NOT excluded
-        if (updatedExcludePathsSet.has(newWatchDirRelative)) {
-          updatedExcludePathsSet.delete(newWatchDirRelative);
-          shouldUpdateOtherWatcher = true;
-          console.log(`  Removing "${newWatchDirRelative}" from excludePaths of "${nameOfOtherWatcher}".`);
-        }
+      if (isOtherParentOfOld && updatedExcludePathsSet.has(oldWatchDirRelative)) {
+        updatedExcludePathsSet.delete(oldWatchDirRelative);
+        shouldUpdateOtherWatcher = true;
+        console.log(`  Removing old watchDir "${oldWatchDirRelative}" from excludePaths of "${nameOfOtherWatcher}".`);
       }
 
-      // Also handle removal of old path if it was a child and is no longer
-      if (isOtherParentOfOld && oldWatchDirRelative !== newWatchDirRelative) {
-        if (updatedExcludePathsSet.has(oldWatchDirRelative)) {
-          updatedExcludePathsSet.delete(oldWatchDirRelative);
-          shouldUpdateOtherWatcher = true;
-          console.log(`  Removing old watchDir "${oldWatchDirRelative}" from excludePaths of "${nameOfOtherWatcher}".`);
-        }
+      // Check if the new watchDir of the current watcher is now a child of this other watcher
+      const relativePathFromOtherToNew = path.relative(otherWatcherWatchDirAbsolute, path.resolve(_globalRootDir, newWatchDirRelative));
+      const isOtherParentOfNew = !relativePathFromOtherToNew.startsWith('..') && relativePathFromOtherToNew !== '';
+      if (isOtherParentOfNew && !updatedExcludePathsSet.has(newWatchDirRelative)) {
+        updatedExcludePathsSet.add(newWatchDirRelative);
+        shouldUpdateOtherWatcher = true;
+        console.log(`  Adding new watchDir "${newWatchDirRelative}" to excludePaths of "${nameOfOtherWatcher}".`);
       }
-
 
       if (shouldUpdateOtherWatcher) {
         otherWatcherConfig.excludePaths = Array.from(updatedExcludePathsSet);
@@ -983,22 +1146,6 @@ async function editWatcherFlow(watcherName) {
       }
     }
   }
-
-
-  // Re-initialize the currently edited watcher instance with new config
-  const existingInstance = watchers.get(watcherName)?.instance;
-  if (existingInstance) {
-    console.log(`\nCleaning up old markers for "${watcherName}" before re-init...`);
-    existingInstance.removeMarkers(true); // Clean up old markers AND their content
-    existingInstance.close(); // Close old watcher instance
-    watchers.delete(watcherName); // Remove old instance from map
-    console.log(`Old instance for "${watcherName}" cleaned and removed.`);
-  }
-
-  // Load and initialize the watcher with the new configuration
-  await loadAndInitializeWatcher(watcherName);
-
-  console.log(`\nWatcher "${watcherName}" reinitialized with new settings.`);
 }
 
 
@@ -1051,7 +1198,9 @@ async function deleteWatcherFlow(watcherToDelete = null) {
       watchers.delete(name); // Remove from active watchers map
       // Store the watchDir before deleting the config for exclusion removal logic
       const deletedWatcherRelativeWatchDir = watcherConfigs[name] && watcherConfigs[name].watchDir;
-      delete watcherConfigs[name]; // Remove from persistent config
+      delete watcherConfigs[name]; // Remove from persistent config in memory
+      _saveConfigsSync(); // Save immediately after deleting a watcher's config
+
       console.log(`\n🗑️ Watcher "${name}" deleted and imports cleaned up.`);
 
       // --- NEW LOGIC: Remove deleted watcher's path from other watchers' excludePaths ---
@@ -1063,7 +1212,7 @@ async function deleteWatcherFlow(watcherToDelete = null) {
             updatedExcludePaths.delete(deletedWatcherRelativeWatchDir);
             otherWatcherConfig.excludePaths = Array.from(updatedExcludePaths);
             console.log(`\n🔄 Removed "${deletedWatcherRelativeWatchDir}" from excludePaths of watcher "${otherWatcherName}".`);
-
+            _saveConfigsSync(); // Save the in-memory change
             // Re-initialize the other watcher to apply the updated excludePaths
             const otherWatcherInstance = watchers.get(otherWatcherName)?.instance;
             if (otherWatcherInstance) {
@@ -1079,7 +1228,6 @@ async function deleteWatcherFlow(watcherToDelete = null) {
       }
       // --- END NEW LOGIC ---
     }
-    _saveConfigsSync(); // Use synchronous save after all updates, ensures consistency
   } else {
     console.log("\nDeletion cancelled.");
   }
@@ -1103,9 +1251,17 @@ async function cleanAndRewriteAllStylesFiles() {
     const lines = content.split('\n');
 
     // Dynamically create regex to find ALL markers for ALL watchers
-    const allMarkerIds = Object.keys(watcherConfigs).concat(
-        Array.from(watchers.keys()) // Include names of currently active watchers too
-    ).filter((value, index, self) => self.indexOf(value) === index); // Get unique IDs
+    const allMarkerIds = new Set(Object.keys(watcherConfigs)); // Use Set for unique IDs from current config
+    // Also include IDs from active watchers that might not be in config yet (shouldn't happen, but for robustness)
+    for (const [name, { config }] of watchers) {
+      if (config.markerId) {
+        allMarkerIds.add(config.markerId);
+      } else {
+        // Default marker ID if not explicitly set
+        allMarkerIds.add(path.basename(config.watchDir).replace(/[\/\\]/g, '_').replace(/^_/, ''));
+      }
+    }
+
 
     let cleanedLines = [];
     let insideMarkerBlock = false;
@@ -1116,8 +1272,8 @@ async function cleanAndRewriteAllStylesFiles() {
       return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the matched substring
     }
 
-    const startMarkerRegexes = allMarkerIds.map(id => new RegExp(`^/\\* ${escapeRegExp(id)} import start \\*/$`, 'm'));
-    const endMarkerRegexes = allMarkerIds.map(id => new RegExp(`^/\\* ${escapeRegExp(id)} import end \\*/$`, 'm'));
+    const startMarkerRegexes = Array.from(allMarkerIds).map(id => new RegExp(`^/\\* ${escapeRegExp(id)} import start \\*/$`, 'm'));
+    const endMarkerRegexes = Array.from(allMarkerIds).map(id => new RegExp(`^/\\* ${escapeRegExp(id)} import end \\*/$`, 'm'));
 
     for (const line of lines) {
       let isStartMarker = startMarkerRegexes.some(regex => regex.test(line.trim()));
@@ -1163,6 +1319,8 @@ async function mainMenu() {
   }
 
   // Initialize all watchers on startup (after rootDir/stylesFile are known)
+  // This is a one-time init for watchers found in watcherConfigs on startup.
+  // handleExternalConfigChange will manage subsequent updates.
   for (const name in watcherConfigs) {
     if (!watchers.has(name)) { // Only initialize if not already running
       await loadAndInitializeWatcher(name);
@@ -1196,7 +1354,7 @@ async function mainMenu() {
           type: "confirm",
           name: "confirm",
           message:
-              "Are you sure you want to exit? This will delete all watchers and clean up all their imports.",
+              "Are you sure you want to exit? This will stop all watchers and clean up all their imports.",
         },
       ]);
       if (confirm) {
@@ -1209,7 +1367,7 @@ async function mainMenu() {
         }
         watchers.clear(); // Clear active watchers map
         watcherConfigs = {}; // Clear persistent watchers config (will be saved empty)
-        _saveConfigsSync(true); // Use synchronous save on exit
+        _saveConfigsOnExit(); // Use new synchronous save on exit to clear file
         // Perform final cleanup of the global styles file
         await cleanAndRewriteAllStylesFiles();
 
@@ -1242,7 +1400,7 @@ process.on('SIGINT', async () => {
   }
   watchers.clear();
   watcherConfigs = {}; // Clear persistent watchers config (will be saved empty)
-  _saveConfigsSync(true); // Use synchronous save on exit
+  _saveConfigsOnExit(); // Use new synchronous save on exit to clear file
 
   // Perform final cleanup of the global styles file
   await cleanAndRewriteAllStylesFiles();
