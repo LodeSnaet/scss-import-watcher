@@ -233,9 +233,9 @@ function scssImportWatcher(options) {
         // If there's a subdirectory in the path after watchDir, the group key is the first subdirectory name.
         groupKey = pathAfterWatchDir.split('/')[0];
       } else {
-        // If it's a direct file/folder import in the watchDir (e.g., "hello" from "test2/hello")
-        // or a partial directly in watchDir (e.g., "_base.scss"), it belongs to the basename of the watchDir.
-        groupKey = path.basename(watchDir); // Use the basename of the current watcher's watchDir
+        // If it's a direct file/folder import in the watchDir (e.g., "_base.scss")
+        // then it belongs to the "base" group.
+        groupKey = 'base'; // Changed to 'base' for direct files in watchDir
       }
       log(`    Group Key: "${groupKey}"`);
 
