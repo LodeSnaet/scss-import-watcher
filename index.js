@@ -212,14 +212,16 @@ function scssImportWatcher(options) {
 
       // --- Grouping logic ---
       let groupKey;
-      const watchDirSlash = watchDir + '/';
+      // Normalize watchDir for consistent path comparison
+      const normalizedWatchDir = watchDir.replace(/\\/g, "/");
+      const watchDirSlash = normalizedWatchDir + '/';
       let pathAfterWatchDir = '';
 
       // Determine the part of the import path that comes after the current watcher's watchDir.
       // This is used to logically group imports within the current watcher's block.
       if (importStatementPath.startsWith(watchDirSlash)) {
         pathAfterWatchDir = importStatementPath.substring(watchDirSlash.length);
-      } else if (importStatementPath === watchDir) {
+      } else if (importStatementPath === normalizedWatchDir) {
         // If the import path is the same as the watchDir (e.g., "@import "test2";" from "test2/index.scss" watched by "test2")
         pathAfterWatchDir = '';
       } else {
@@ -235,7 +237,7 @@ function scssImportWatcher(options) {
       } else {
         // If it's a direct file/folder import in the watchDir (e.g., "_base.scss")
         // then it belongs to the "base" group.
-        groupKey = 'base'; // Changed to 'base' for direct files in watchDir
+        groupKey = 'base'; // Set to 'base' for files directly in the watchDir
       }
       log(`    Group Key: "${groupKey}"`);
 
