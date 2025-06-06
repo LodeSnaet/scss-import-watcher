@@ -17,6 +17,7 @@
   "author": "Lode Snaet",
   "license": "MIT",
   "dependencies": {
+    "chalk": "^5.4.1",
     "chokidar": "^3.6.0",
     "inquirer": "^12.6.3"
   }

@@ -5,16 +5,110 @@ const fs = require("fs");
 const scssImportWatcher = require("../index"); // This path should point to your scssImportWatcher.js file
 const inquirer = require("inquirer").default;
 
-const watchers = new Map(); // key: name, value: { config, instance }
-let _globalRootDir = null; // Store the root directory once it's set
+// --- Global State ---
+// watchers Map: Holds actively running watcher instances and their full configurations (including derived rootDir and stylesFile).
+// This is primarily for managing the *live* watchers.
+const watchers = new Map(); // key: name, value: { config: fullConfig, instance, isActive }
+
+// watcherConfigs object: Holds the individual watcher configurations loaded from/saved to the JSON file.
+// This is the source of truth for persistent watcher settings (watchDir, line, excludePaths).
+let watcherConfigs = {}; // key: name, value: { name, watchDir, line, excludePaths }
+
+// projectSettings object: Holds global project settings (rootDir, stylesFile) loaded from/saved to JSON.
+let projectSettings = {}; // { rootDir: absolutePath, stylesFile: relativePath }
+
+let _globalRootDir = null; // Stored as absolute path
+let _globalStylesFile = null; // Stored as path relative to _globalRootDir
+
+let configFileWatcher = null; // To hold the fs.FSWatcher instance for watchers.json
+let saveTimeout = null; // For debouncing config file writes
+const SAVE_DEBOUNCE_DELAY = 500; // milliseconds
+
+// --- Helper Functions ---
+
+// Function to get the full path to the watchers.json file
+function getWatchersConfigPath() {
+  if (!_globalRootDir) {
+    // Fallback if _globalRootDir isn't set yet (e.g., first run before prompt)
+    // This is primarily for initial loading or when projectSettings are cleared.
+    return path.join(process.cwd(), "scss-watcher-config.json");
+  }
+  return path.join(_globalRootDir, ".scss-watcher", "config.json");
+}
+
+function loadConfigs() {
+  const configPath = getWatchersConfigPath();
+  if (fs.existsSync(configPath)) {
+    try {
+      const rawConfig = fs.readFileSync(configPath, "utf8");
+      const parsedConfig = JSON.parse(rawConfig);
+      watcherConfigs = parsedConfig.watchers || {};
+      projectSettings = parsedConfig.projectSettings || {};
+      console.log(`Loaded configuration from: ${configPath}`);
+    } catch (error) {
+      console.error(`Error loading configuration from ${configPath}:`, error.message);
+      watcherConfigs = {};
+      projectSettings = {};
+    }
+  } else {
+    console.log("No existing configuration found. Starting fresh.");
+  }
+}
+
+function saveConfigs(clearWatchersOnly = false) {
+  if (saveTimeout) {
+    clearTimeout(saveTimeout);
+  }
+  saveTimeout = setTimeout(() => {
+    const configPath = getWatchersConfigPath();
+    const configDir = path.dirname(configPath);
+
+    if (!fs.existsSync(configDir)) {
+      fs.mkdirSync(configDir, { recursive: true });
+    }
+
+    const configToSave = {
+      watchers: clearWatchersOnly ? {} : watcherConfigs, // If clearing, save empty watchers
+      projectSettings: projectSettings,
+    };
+
+    try {
+      fs.writeFileSync(configPath, JSON.stringify(configToSave, null, 2), "utf8");
+      // console.log(`Configuration saved to: ${configPath}`); // Suppress for less verbosity
+    } catch (error) {
+      console.error(`Error saving configuration to ${configPath}:`, error.message);
+    }
+  }, SAVE_DEBOUNCE_DELAY);
+}
+
+// Helper to recursively check for SCSS files in a directory
+function containsScssFiles(dir) {
+  if (!fs.existsSync(dir)) return false;
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isFile() && entry.name.endsWith(".scss")) {
+      return true;
+    }
+    if (entry.isDirectory()) {
+      // Limited recursion depth for performance in CLI Browse
+      // For a robust check, you might want a more controlled recursion or async approach
+      // For now, this simple recursive check should be sufficient for typical project structures.
+      if (containsScssFiles(fullPath)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 // Helper to list folders and files in a directory
 function listFoldersAndFiles(dir) {
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     const folders = entries
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => `📁 ${entry.name}`); // Add folder icon
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => `📁 ${entry.name}`); // Add folder icon
     return { folders: folders.sort() };
   } catch (error) {
     // Return empty arrays on error, so inquirer doesn't crash on ENOENT
@@ -22,7 +116,7 @@ function listFoldersAndFiles(dir) {
   }
 }
 
-// NEW FUNCTION: Generic directory browser
+// Generic directory browser
 async function browseForDirectory(startDir, message) {
   let current = startDir;
   while (true) {
@@ -35,822 +129,719 @@ async function browseForDirectory(startDir, message) {
       isValidDir = false; // Path does not exist or is not a directory
     }
 
-    if (!isValidDir) {
-      console.log(
-        `❌ Path not found or is not a directory: ${current}. Please navigate or select an existing folder.`,
-      );
-      // If the current path became invalid, try to go up one level
-      if (current !== startDir) {
-        current = path.dirname(current);
-      } else {
-        // If we are at the startDir and it's invalid, we need a way out
-        console.log("Cannot navigate from an invalid starting point.");
-        // This might need a more robust initial check in promptRootFolder
-        return null; // Indicate failure to browse
-      }
-      continue; // Retry the loop with the (potentially) new current path
-    }
-
-    const { folders } = listFoldersAndFiles(current);
-
-    let choices = [];
-    const isFilesystemRoot = path.dirname(current) === current; // Check if it's the filesystem root (e.g., C:\, /)
-
-    if (!isFilesystemRoot) {
-      choices.push({ name: "↩️ .. (go up)", value: "__UP__" }); // Add back icon for 'go up'
-    }
-
-    if (folders.length > 0) {
-      // Add subfolders, stripping the emoji for the value
-      choices = choices.concat(
-        folders.map((f) => ({ name: f, value: f.replace(/^📁\s*/, "") })),
-      );
-    } else {
-      console.log("⚠️ No subfolders found in this directory.");
-    }
-
-    choices.push(new inquirer.Separator());
-    choices.push({ name: "✅ Select this folder", value: "__SELECT_THIS_FOLDER__" });
-    choices.push({ name: "❌ Cancel", value: "__CANCEL__" });
-
-    const { selected } = await inquirer.prompt([
+    const { choice } = await inquirer.prompt([
       {
         type: "list",
-        name: "selected",
-        message: `${message}\nCurrent path: ${path.relative(startDir, current) || "."}`,
-        choices,
-      },
-    ]);
-
-    if (selected === "__SELECT_THIS_FOLDER__") {
-      return current; // Return the current path if selected
-    } else if (selected === "__CANCEL__") {
-      return null; // User cancelled
-    } else if (selected === "__UP__") {
-      current = path.dirname(current);
-    } else {
-      current = path.join(current, selected);
-    }
-  }
-}
-
-// MODIFIED: promptRootFolder to validate and offer Browse
-async function promptRootFolder() {
-  while (true) {
-    const { method } = await inquirer.prompt([
-      {
-        type: "list",
-        name: "method",
-        message: "How do you want to set the project root folder?",
+        name: "choice",
+        message: `${message}\nCurrent: ${current}\n${
+            isValidDir
+                ? "🟢 Current path is a valid directory."
+                : "🔴 Current path is NOT a valid directory."
+        }\nSelect an action:`,
         choices: [
-          { name: `✍️ Enter path (default: ${process.cwd()})`, value: "manual" },
-          { name: "🔍 Browse from current directory", value: "browse" },
-          { name: "🚪 Exit CLI", value: "exit" },
+          { name: "✅ Use this directory", value: "use" },
+          { name: "⬆️ Go up one level", value: "up" },
+          new inquirer.Separator(),
+          ...listFoldersAndFiles(current).folders.map((f) => ({
+            name: f,
+            value: f.substring(2), // Remove emoji for value
+          })),
+          { name: "✏️ Enter path manually", value: "manual" },
+          { name: "⬅️ Back (Cancel)", value: "back" } // Added back/cancel option
         ],
       },
     ]);
 
-    if (method === "exit") {
-      console.log("👋 Exiting CLI. Goodbye!");
-      process.exit(0);
-    }
+    if (choice === "use") {
+      let isFinalSelectionValid = isValidDir;
+      if (isFinalSelectionValid && (message.includes("root directory") || message.includes("directory to watch"))) {
+        // For root and watch directories, validate that they contain SCSS files
+        if (!containsScssFiles(current)) {
+          console.log("🚫 The selected directory or its subdirectories must contain at least one .scss file.");
+          isFinalSelectionValid = false;
+        }
+      }
 
-    let selectedPath = null;
-    if (method === "manual") {
-      const { rootDirInput } = await inquirer.prompt([
-        {
+      if (isFinalSelectionValid) {
+        return current;
+      } else {
+        console.log("🚫 Please choose a valid directory or enter manually.");
+        current = await inquirer.prompt({
           type: "input",
-          name: "rootDirInput",
-          message: "Enter the root folder path:",
-          default: process.cwd(),
-        },
-      ]);
-      selectedPath = path.resolve(rootDirInput);
-    } else if (method === "browse") {
-      selectedPath = await browseForDirectory(
-        process.cwd(), // Start Browse from where the CLI is run
-        "Navigate to your project root folder:",
-      );
-      if (selectedPath === null) {
-        // User cancelled Browse, go back to method selection
-        console.log("Root folder selection cancelled. Please try again.");
-        continue;
+          name: "path",
+          message: "Enter the path manually:",
+          default: current,
+          validate: (input) => {
+            const trimmedInput = input.trim();
+            if (!fs.existsSync(trimmedInput)) {
+              return "Directory does not exist.";
+            }
+            if (!fs.lstatSync(trimmedInput).isDirectory()) {
+              return "Path is not a directory.";
+            }
+            if (message.includes("root directory") || message.includes("directory to watch")) {
+              if (!containsScssFiles(trimmedInput)) {
+                return "The selected directory or its subdirectories must contain at least one .scss file.";
+              }
+            }
+            return true;
+          }
+        }).then(ans => ans.path.trim()); // Trim immediately after getting input
+        // Continue loop to re-validate manual entry
       }
-    }
-
-    // Validate the chosen/entered path
-    try {
-      const stats = fs.lstatSync(selectedPath);
-      if (stats.isDirectory()) {
-        return selectedPath; // Valid directory found
+    } else if (choice === "up") {
+      const parent = path.dirname(current);
+      if (parent === current) { // Root directory check
+        console.log("🚫 Already at the root directory.");
       } else {
-        console.log(`❌ Path is not a directory: ${selectedPath}. Please select a folder.`);
+        current = parent;
       }
-    } catch (error) {
-      if (error.code === 'ENOENT') {
-        console.log(`❌ Path not found: ${selectedPath}. Please try again.`);
-      } else {
-        console.log(`❌ Error validating path: ${error.message}. Please try again.`);
-      }
-    }
-  }
-}
-
-// EXISTING: promptFolderTraversal (specific to selecting watch subfolders within _globalRootDir)
-async function promptFolderTraversal(baseDir) {
-  let current = baseDir;
-  while (true) {
-    // Only list folders; files are not relevant for selecting a watch directory
-    const { folders } = listFoldersAndFiles(current);
-    const isRoot = current === baseDir;
-
-    let choices = [];
-    if (!isRoot) {
-      choices.push({ name: "↩️ .. (go up)", value: "__UP__" }); // Add back icon for 'go up'
-    }
-
-    if (folders.length > 0) {
-      choices = choices.concat(
-        folders.map(f => ({ name: f, value: f.replace(/^📁\s*/, '') }))
-      );
-    }
-
-    choices.push(new inquirer.Separator());
-
-    // Allow selecting "this folder" if it's NOT the root directory
-    if (!isRoot) {
-      choices.push({ name: "✅ Select this folder", value: "__SELECT_THIS_FOLDER__" });
+    } else if (choice === "manual") {
+      const { manualPath } = await inquirer.prompt({
+        type: "input",
+        name: "manualPath",
+        message: "Enter the directory path:",
+        default: current,
+        validate: (input) => {
+          const trimmedInput = input.trim();
+          if (!fs.existsSync(trimmedInput)) {
+            return "Directory does not exist.";
+          }
+          if (!fs.lstatSync(trimmedInput).isDirectory()) {
+            return "Path is not a directory.";
+          }
+          if (message.includes("root directory") || message.includes("directory to watch")) {
+            if (!containsScssFiles(trimmedInput)) {
+              return "The selected directory or its subdirectories must contain at least one .scss file.";
+            }
+          }
+          return true;
+        }
+      });
+      current = manualPath.trim(); // Trim manual path input
+    } else if (choice === "back") {
+      return null; // User chose to cancel/go back
     } else {
-      // This message is for the specific rule of not watching the project root itself
-      console.log(
-        "⚠️ You must select a subfolder, not the project root directory directly for watching.",
-      );
-    }
-
-    // Add a specific message if no subfolders are available at the root and user can't select root
-    if (isRoot && folders.length === 0) {
-      console.log(
-        "⚠️ No subfolders found here. Please create one in your project root or choose a different root.",
-      );
-      // In this specific case, if no choices are available (only __UP__ and __CANCEL__),
-      // Inquirer will still throw ValidationError if 'Select this folder' is also not allowed.
-      // The current promptFolderTraversal already leads to this error if choices are empty
-      // so it's generally good to ensure 'choices' is never truly empty by offering a 'back' or 'cancel'.
-      // If it reaches here and `choices` is only '..', then the error will still occur if it's the root.
-      // We need to ensure there's always a valid selection or exit option.
-    }
-
-    // If no folders and at root, and 'Select this folder' is not allowed,
-    // ensure there's an exit option to prevent ValidationError.
-    if (isRoot && folders.length === 0 && choices.length <= 1) { // Only '..' might be present
-      choices.push({ name: "❌ Go back to Main Menu", value: "__BACK_TO_MAIN__" });
-    }
-
-
-    const { folder } = await inquirer.prompt([
-      {
-        type: "list",
-        name: "folder",
-        message: `Current path for watcher: ${path.relative(baseDir, current) || "."}`,
-        choices,
-      },
-    ]);
-
-    if (folder === "__SELECT_THIS_FOLDER__") {
-      return current; // Return the current path if selected
-    } else if (folder === "__UP__") {
-      current = path.dirname(current);
-    } else if (folder === "__BACK_TO_MAIN__") {
-      return null; // User chose to go back
-    }
-    else {
-      current = path.join(current, folder); // The value already has emoji stripped
+      // User selected a subfolder
+      current = path.join(current, choice.trim()); // Trim choice before joining
     }
   }
 }
 
-// ... (rest of your existing code remains the same) ...
-// NEW HELPER: Function to get SCSS files directly in a directory (no subdirectories)
-function listScssFilesAtRoot(dir) {
+// New helper function to list SCSS files
+function listScssFilesInDir(dir) {
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir, { withFileTypes: true })
+      .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith(".scss"))
+      .map(entry => `📄 ${entry.name}`) // Add file icon
+      .sort();
+}
+
+// NEW FUNCTION: Helper to list NON-PARTIAL SCSS files directly in a directory
+function listNonPartialScssFilesInDir(dir) {
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir, { withFileTypes: true })
+      .filter(entry => entry.isFile() && entry.name.toLowerCase().endsWith(".scss") && !entry.name.startsWith("_"))
+      .map(entry => `📄 ${entry.name}`) // Add file icon
+      .sort();
+}
+
+
+// Constants for the header flag markers
+const FLAG_START_MARKER = '/* SCSS_WATCHER_SUMMARY_START */';
+const FLAG_END_MARKER = '/* SCSS_WATCHER_SUMMARY_END */';
+
+/**
+ * Updates the header flag in a styles file with the list of associated watcher names.
+ * This function will replace its own previously inserted block or prepend a new one.
+ * @param {string} filePath - Absolute path to the styles.scss file.
+ * @param {string[]} watcherNames - Array of watcher names associated with this file.
+ */
+async function updateStylesFileHeaderFlag(filePath, watcherNames) {
+  if (!fs.existsSync(filePath)) {
+    console.warn(`Warning: Styles file not found at ${filePath}. Cannot update header flag.`);
+    return;
+  }
+
+  let content = fs.readFileSync(filePath, 'utf8');
+  let lines = content.split(/\r?\n/);
+
+  // Remove existing flag block if present
+  let startIndex = -1;
+  let endIndex = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes(FLAG_START_MARKER)) {
+      startIndex = i;
+    }
+    if (lines[i].includes(FLAG_END_MARKER)) {
+      endIndex = i;
+      break; // Found the end marker, stop searching
+    }
+  }
+
+  if (startIndex !== -1 && endIndex !== -1 && endIndex >= startIndex) {
+    // Valid block found, remove it
+    lines.splice(startIndex, endIndex - startIndex + 1);
+  } else if (startIndex !== -1) {
+    // Only start marker found (malformed block), remove from start marker onwards
+    lines.splice(startIndex);
+  } else if (endIndex !== -1) {
+    // Only end marker found (malformed block), remove up to end marker
+    lines.splice(0, endIndex + 1);
+  }
+
+  let newFlagLines = [];
+  if (watcherNames.length > 0) {
+    const sortedNames = watcherNames.sort();
+    newFlagLines.push(FLAG_START_MARKER);
+    newFlagLines.push(`/* Watchers for this file: [${sortedNames.join(', ')}] */`);
+    newFlagLines.push(FLAG_END_MARKER);
+    // Add a blank line after the flag block if there's existing content following it
+    if (lines.length > 0 && lines[0].trim().length > 0) {
+      newFlagLines.push('');
+    }
+  } else {
+    // If no watchers for this file, the block will simply be removed and not re-added.
+  }
+
+  // Prepend the new flag lines to the content
+  lines.splice(0, 0, ...newFlagLines);
+
+  // Normalize multiple blank lines in the entire file after insertion to at most two
+  const finalContent = lines.join('\n').replace(/\n{3,}/g, '\n\n');
+
   try {
-    return fs
-      .readdirSync(dir, { withFileTypes: true })
-      .filter((d) => d.isFile() && d.name.toLowerCase().endsWith(".scss"))
-      .map((d) => d.name);
+    fs.writeFileSync(filePath, finalContent, 'utf8');
+    // console.log(`Updated header flag in ${path.basename(filePath)}.`); // Too verbose, log only for errors
   } catch (error) {
-    // console.error(`❌ Error reading directory ${dir}: ${error.message}`); // Suppress this specific error here, handled higher up
-    return [];
+    console.error(`❌ Error updating header flag in ${path.basename(filePath)}:`, error.message);
   }
 }
 
-// UPDATED: promptStylesFile to enforce root-level SCSS files and reuse existing
-async function promptStylesFile() {
-  // Ensure _globalRootDir is valid before proceeding
-  if (!_globalRootDir || !fs.existsSync(_globalRootDir) || !fs.lstatSync(_globalRootDir).isDirectory()) {
-    console.log("❌ Project root is not set or is invalid. Please set a valid project root first.");
-    return null; // Indicate failure
-  }
+/**
+ * Gathers all unique styles files from active watchers and their associated watcher names.
+ * @returns {Map<string, Set<string>>} A map where key is absolute styles file path and value is a Set of watcher names.
+ */
+function getStylesFileToWatcherMap() {
+  const map = new Map();
+  watchers.forEach(watcherData => {
+    const absStylesFilePath = path.resolve(watcherData.config.rootDir, watcherData.config.stylesFile);
+    if (!map.has(absStylesFilePath)) {
+      map.set(absStylesFilePath, new Set());
+    }
+    map.get(absStylesFilePath).add(watcherData.config.label); // Using label as watcher name for the flag
+  });
+  return map;
+}
 
-  const availableRootScssFiles = listScssFilesAtRoot(_globalRootDir);
+/**
+ * Refreshes the header flags for all styles files managed by active watchers.
+ */
+async function refreshAllStylesFileFlags() {
+  const stylesFileMap = getStylesFileToWatcherMap();
 
-  const previouslyUsedRootFiles = new Set();
-  // Filter existing watcher styles files to only include those truly at the root
-  for (const [name, { config }] of watchers) {
-    // Check if stylesFile has no path separators, meaning it's a direct child of root
-    // Also, ensure the file actually exists and is readable.
-    const fullPath = path.resolve(_globalRootDir, config.stylesFile);
-    if (!config.stylesFile.includes(path.sep) && fs.existsSync(fullPath) && fs.lstatSync(fullPath).isFile()) {
-      previouslyUsedRootFiles.add(config.stylesFile);
+  // If _globalRootDir and _globalStylesFile are set, ensure that main styles file is
+  // also considered for flag update, even if no active watcher currently targets it
+  // (e.g., after all watchers are deleted, or before any are created).
+  if (_globalRootDir && _globalStylesFile) {
+    const globalAbsStylesFile = path.resolve(_globalRootDir, _globalStylesFile);
+    if (!stylesFileMap.has(globalAbsStylesFile)) {
+      stylesFileMap.set(globalAbsStylesFile, new Set()); // Add it to ensure its flag can be cleared
     }
   }
 
-  // Combine available files and previously used files, ensuring uniqueness and sorting
-  const choicesSet = new Set([
-    ...availableRootScssFiles,
-    ...Array.from(previouslyUsedRootFiles),
-  ]);
-  const sortedChoices = Array.from(choicesSet)
-    .sort()
-    .map((f) => ({ name: `📄 ${f}`, value: f }));
-
-  if (sortedChoices.length === 0) {
-    console.log("⚠️ No existing SCSS files found at the project root to select.");
+  for (const [filePath, watcherNamesSet] of stylesFileMap.entries()) {
+    await updateStylesFileHeaderFlag(filePath, Array.from(watcherNamesSet));
   }
+}
+
+// --- NEW/Refactored Helper Functions for Project Settings ---
+
+/**
+ * Handles the flow for setting or editing the project's root directory.
+ * @returns {boolean} True if root directory was successfully set/confirmed, false if cancelled.
+ */
+async function setRootDirFlow() {
+  const newRootDir = await browseForDirectory(
+      _globalRootDir || process.cwd(),
+      "Select your project's new root directory:"
+  );
+
+  if (!newRootDir) { // User cancelled Browse
+    console.log("Root directory selection cancelled.");
+    return false;
+  }
+
+  if (newRootDir !== _globalRootDir) {
+    // Only ask for confirmation if there are existing watchers that would be affected
+    if (watchers.size > 0) {
+      const { confirmChange } = await inquirer.prompt({
+        type: "confirm",
+        name: "confirmChange",
+        message: "Changing the root directory will delete ALL existing watchers as their paths will become invalid. Are you sure?",
+        default: false,
+      });
+
+      if (!confirmChange) {
+        console.log("Root directory change cancelled.");
+        return false;
+      }
+    }
+
+    // Delete all existing watchers and clean up their imports
+    const allWatcherNames = Array.from(watchers.keys());
+    for (const name of allWatcherNames) {
+      const watcherData = watchers.get(name);
+      if (watcherData && watcherData.instance) {
+        watcherData.instance.removeMarkers(true); // Remove markers and contents
+        watcherData.instance.close();
+      }
+      watchers.delete(name);
+      delete watcherConfigs[name]; // Also remove from persistent config
+      console.log(`🗑️ Watcher "${name}" deleted due to root directory change.`);
+    }
+
+    _globalRootDir = newRootDir;
+    _globalStylesFile = null; // Reset global styles file as it's relative to the root dir
+
+    projectSettings.rootDir = _globalRootDir;
+    projectSettings.stylesFile = _globalStylesFile; // Clear it in settings too
+    saveConfigs();
+
+    await refreshAllStylesFileFlags();
+    console.log(`✅ Root directory updated to: ${_globalRootDir}`);
+    console.log("Please re-set your Global Styles File and create new watchers if needed.");
+    return true;
+  } else {
+    console.log("Root directory not changed. It's already set to the selected path.");
+    return true;
+  }
+}
+
+/**
+ * Handles the flow for setting or editing the global styles file.
+ * Requires _globalRootDir to be set.
+ * @returns {boolean} True if global styles file was successfully set/confirmed, false if cancelled.
+ */
+async function setGlobalStylesFileFlow() {
+  if (!_globalRootDir) {
+    console.log("🚫 Please set the Root Directory first.");
+    return false;
+  }
+
+  // Get non-partial SCSS files directly in root
+  const directScssFiles = listNonPartialScssFilesInDir(_globalRootDir);
+
+  let choices = [];
+  if (directScssFiles.length > 0) {
+    choices.push(new inquirer.Separator('Available SCSS Files in Root:'));
+    choices.push(...directScssFiles.map(f => ({ name: f, value: f.substring(2) })));
+  } else {
+    choices.push({ name: "No non-partial SCSS files found directly in the root directory.", value: "no_files", disabled: true });
+  }
+
+  choices.push(new inquirer.Separator());
+  choices.push({ name: "✏️ Enter file path manually (must be in root, non-partial .scss)", value: "manual" });
+  choices.push({ name: "⬅️ Cancel Global Styles File Setup", value: "cancel" });
 
 
   const { selectedFile } = await inquirer.prompt([
     {
       type: "list",
       name: "selectedFile",
-      message:
-        "Select an SCSS file for imports or enter a new one (must be at project root):",
-      choices: [
-        ...sortedChoices,
-        new inquirer.Separator(),
-        { name: "🆕 Enter a new file name", value: "__new" },
-        { name: "↩️ Go back", value: "__back" },
-      ],
+      message: `Select your main SCSS file (must be a non-partial .scss file directly in the root directory):\nRoot: ${_globalRootDir}`,
+      choices: choices,
     },
   ]);
 
-  if (selectedFile === "__back") {
-    return null; // Indicates user wants to go back
-  }
+  let newStylesFileAbsolute = null;
 
-  if (selectedFile !== "__new") return selectedFile; // Return selected existing file
+  if (selectedFile === "cancel") {
+    console.log("Global Styles File selection cancelled.");
+    return false;
+  } else if (selectedFile === "manual") {
+    const { manualPath } = await inquirer.prompt({
+      type: "input",
+      name: "manualPath",
+      message: "Enter the SCSS file path (e.g., 'style.scss', 'main.scss') relative to root directory:",
+      validate: (input) => {
+        const trimmedInput = input.trim();
+        const absPath = path.resolve(_globalRootDir, trimmedInput);
 
-  // If "__new" is selected, prompt for a new filename and validate
-  while (true) {
-    const { newFileName } = await inquirer.prompt([
-      {
-        type: "input",
-        name: "newFileName",
-        message:
-          "Enter the name for the new SCSS file (e.g., main.scss - must be at project root, no subfolders):",
-        validate: (input) => {
-          if (!input.trim()) return "File name cannot be empty.";
-          if (!input.toLowerCase().endsWith(".scss"))
-            return "File name must end with .scss";
-          // Check for path separators
-          if (input.includes("/") || input.includes("\\"))
-            return "File cannot be in a subfolder; it must be at the project root.";
-          return true;
-        },
-      },
-    ]);
-    return newFileName.trim(); // Return the validated filename
-  }
-}
-
-async function promptWatcherName(defaultName, excludeName = null) {
-  while (true) {
-    const { name } = await inquirer.prompt([
-      {
-        type: "input",
-        name: "name",
-        message: "Name this watcher:",
-        default: defaultName,
-      },
-    ]);
-    if (name === excludeName || !watchers.has(name)) return name;
-    console.log(
-      "❌ Watcher name already exists. Please choose a different name.",
-    );
-  }
-}
-
-// Helper to extract the import path from an @import line, harmonized with scssImportWatcher's.
-function getImportPathFromLine(line) {
-  const match = line.match(/@import\s*['"](.+?)['"];/);
-  return match ? match[1].replace(/\\/g, "/") : null; // Normalize to POSIX style
-}
-
-/**
- * Performs a global cleanup on all SCSS styles files managed by current watchers,
- * plus any explicitly provided files.
- * It removes all existing marker blocks and any floating imports that will be managed by a *currently active* watcher.
- * @param {string[]} [additionalFilesToClean=[]] - List of absolute file paths to also clean.
- */
-async function cleanAndRewriteAllStylesFiles(additionalFilesToClean = []) {
-  const allStylesFiles = new Set();
-  const watcherConfigs = Array.from(watchers.values()).map((w) => w.config);
-
-  // Collect all unique styles files used by *any active* watcher
-  watcherConfigs.forEach((config) => {
-    allStylesFiles.add(path.resolve(_globalRootDir, config.stylesFile));
-  });
-
-  // Add any explicitly requested files to clean (e.g., from stopped watchers)
-  additionalFilesToClean.forEach((filePath) => {
-    allStylesFiles.add(filePath);
-  });
-
-  if (allStylesFiles.size === 0) {
-    // No styles files to process, either active or explicit.
-    return;
-  }
-
-  console.log("🧹 Performing global cleanup and re-homing of SCSS imports...");
-
-  for (const stylesFilePath of allStylesFiles) {
-    if (!fs.existsSync(stylesFilePath)) {
-      console.warn(
-        `⚠️ Styles file not found during cleanup: ${path.basename(stylesFilePath)}. Skipping.`,
-      );
-      continue;
-    }
-
-    let fileContent = fs.readFileSync(stylesFilePath, "utf8");
-    let lines = fileContent.split(/\r?\n/);
-    let cleanedLines = [];
-
-    // Set to store all import paths that *any* currently configured watcher will manage,
-    // specifically for *this* stylesFilePath.
-    const allManagedImportPathsForThisFile = new Set();
-
-    // Populate allManagedImportPathsForThisFile
-    for (const config of watcherConfigs) {
-      // Only consider watchers that write to *this specific* stylesFilePath
-      if (path.resolve(_globalRootDir, config.stylesFile) === stylesFilePath) {
-        // Create a temporary instance to get its generated import paths
-        const tempWatcher = scssImportWatcher({
-          ...config,
-          label: `TEMP_CLEANUP_FOR_${config.name}`,
-          markerId: config.name,
-        });
-        const generatedPaths = tempWatcher._getGeneratedImportPaths();
-        tempWatcher.close();
-
-        generatedPaths.forEach((p) => {
-          allManagedImportPathsForThisFile.add(p);
-        });
-      }
-    }
-
-    let inAnyMarkerBlock = false; // Flag to track if we are inside ANY marker block
-
-    // Process lines to remove old marker blocks and floating managed imports
-    for (const line of lines) {
-      // Update inAnyMarkerBlock flag based on marker start/end lines
-      const startMatch = line.match(/\/\*\s*(.+?) import start\s*\*\//);
-      const endMatch = line.match(/\/\*\s*(.+?) import end\s*\*\//);
-
-      if (startMatch) {
-        inAnyMarkerBlock = true;
-        // Skip the start marker line itself as it will be re-inserted by its owning watcher
-        continue;
-      } else if (endMatch) {
-        inAnyMarkerBlock = false;
-        // Skip the end marker line itself
-        continue;
-      }
-
-      // If we are inside any marker block, skip the content for now.
-      // This content will be re-generated by the appropriate active watcher.
-      if (inAnyMarkerBlock) {
-        continue;
-      }
-
-      // Handle floating imports outside any marker block
-      const importPath = getImportPathFromLine(line); // This now extracts and normalizes
-      if (importPath) {
-        // If this floating import path is managed by *any* currently active watcher
-        // (i.e., it's in allManagedImportPathsForThisFile), then remove it.
-        // This is where the 'duplicate removal' happens for floating imports.
-        if (allManagedImportPathsForThisFile.has(importPath)) {
-          continue; // Skip this import line as it will be re-homed
+        if (!absPath.startsWith(_globalRootDir) || path.dirname(absPath) !== _globalRootDir) {
+          return "File must be directly in the project root directory.";
         }
+        if (!fs.existsSync(absPath)) {
+          return "File does not exist.";
+        }
+        if (!fs.lstatSync(absPath).isFile()) {
+          return "Path is not a file.";
+        }
+        if (!trimmedInput.toLowerCase().endsWith(".scss")) {
+          return "File must have a .scss extension.";
+        }
+        if (path.basename(trimmedInput).startsWith("_")) {
+          return "File cannot be a partial (cannot start with '_').";
+        }
+        return true;
       }
-
-      // Keep lines that are not markers, not inside markers, and not managed imports
-      cleanedLines.push(line);
-    }
-
-    // Remove any excessive blank lines left after cleanup
-    const finalContent = cleanedLines.join("\n").replace(/\n{3,}/g, "\n\n");
-
-    fs.writeFileSync(stylesFilePath, finalContent, "utf8");
-    console.log(`✅ Cleaned imports in ${path.basename(stylesFilePath)}.`);
-  }
-}
-
-async function updateWatcherExclusions(additionalFilesToClean = []) {
-  const currentWatcherConfigs = Array.from(watchers.values()).map(
-    (w) => w.config,
-  );
-
-  // Close all existing watcher instances
-  for (const [name, { instance }] of watchers) {
-    if (instance) {
-      instance.close();
-    }
-  }
-  watchers.clear(); // Clear the map before re-populating
-
-  // NEW: Perform global cleanup, including explicitly provided files.
-  // This step removes old marker blocks and floating imports claimed by *active* watchers.
-  await cleanAndRewriteAllStylesFiles(additionalFilesFilesToClean); // Typo fixed here: additionalFilesToClean
-
-  // Re-create all watchers with updated exclusion paths
-  for (const config of currentWatcherConfigs) {
-    const currentWatcherWatchFolderAbs = path.resolve(
-      config.rootDir,
-      config.watchDir,
-    );
-    const excludePathsForThisWatcher = [];
-
-    for (const otherConfig of currentWatcherConfigs) {
-      if (config.name === otherConfig.name) continue;
-
-      const otherWatcherWatchFolderAbs = path.resolve(
-        otherConfig.rootDir,
-        otherConfig.watchDir,
-      );
-
-      if (
-        otherWatcherWatchFolderAbs.startsWith(
-          currentWatcherWatchFolderAbs + path.sep,
-        )
-      ) {
-        excludePathsForThisWatcher.push(otherWatcherWatchFolderAbs);
-      }
-    }
-
-    const instance = scssImportWatcher({
-      ...config,
-      label: `${config.name}: ${config.watchDir} → ${config.stylesFile}`,
-      markerId: config.name,
-      excludePaths: excludePathsForThisWatcher,
     });
-    watchers.set(config.name, { config, instance });
-    instance._initialUpdate(); // This will now write to a cleaned file
+    newStylesFileAbsolute = path.resolve(_globalRootDir, manualPath.trim());
+  } else {
+    // User selected from the list
+    newStylesFileAbsolute = path.resolve(_globalRootDir, selectedFile);
   }
-  console.log("🔄 Watchers re-initialized with updated exclusion paths.");
+
+  let newStylesFileRelative = path.relative(_globalRootDir, newStylesFileAbsolute);
+
+  if (newStylesFileRelative !== _globalStylesFile) {
+    if (watchers.size > 0) {
+      const { confirmChange } = await inquirer.prompt({
+        type: "confirm",
+        name: "confirmChange",
+        message: "Changing the global styles file will restart all existing watchers to update their target file. Continue?",
+        default: false,
+      });
+
+      if (!confirmChange) {
+        console.log("Global Styles File change cancelled.");
+        return false;
+      }
+    }
+
+    const oldStylesFileAbsolutePath = _globalRootDir && _globalStylesFile ? path.resolve(_globalRootDir, _globalStylesFile) : null;
+    _globalStylesFile = newStylesFileRelative;
+    projectSettings.stylesFile = _globalStylesFile;
+    saveConfigs();
+
+    const watchersToRestart = Array.from(watchers.keys());
+    for (const name of watchersToRestart) {
+      const watcherData = watchers.get(name);
+      if (watcherData && watcherData.instance) {
+        watcherData.instance.close();
+        console.log(`Restarting watcher "${name}" with new styles file...`);
+        const newConfig = {
+          ...watcherData.config,
+          stylesFile: _globalStylesFile,
+        };
+        const newInstance = scssImportWatcher(newConfig);
+        newInstance._initialUpdate();
+        watchers.set(name, { ...watcherData, config: newConfig, instance: newInstance });
+      }
+    }
+
+    if (oldStylesFileAbsolutePath && oldStylesFileAbsolutePath !== path.resolve(_globalRootDir, _globalStylesFile)) {
+      try {
+        await updateStylesFileHeaderFlag(oldStylesFileAbsolutePath, []);
+        console.log(`Cleaned up old styles file: ${path.basename(oldStylesFileAbsolutePath)}`);
+      } catch (error) {
+        console.error(`Error cleaning old styles file ${path.basename(oldStylesFileAbsolutePath)}: ${error.message}`);
+      }
+    }
+
+    await refreshAllStylesFileFlags();
+    console.log(`✅ Global Styles File updated to: ${_globalStylesFile}`);
+    return true;
+  } else {
+    console.log("Global Styles File not changed. It's already set to the selected path.");
+    return true;
+  }
 }
+
+
+// --- Project Setup Flow ---
+async function projectSettingsFlow() {
+  console.log("\n--- Project Setup ---");
+
+  // 1. Ask for Root Directory
+  const rootDirSet = await setRootDirFlow();
+  if (!rootDirSet) {
+    console.log("Project setup cancelled during Root Directory selection. Exiting.");
+    process.exit(0);
+  }
+
+  // 2. Ask for Global Styles File
+  const stylesFileSet = await setGlobalStylesFileFlow(); // This needs to be modified for the new constraints
+  if (!stylesFileSet) {
+    console.log("Project setup cancelled during Global Styles File selection. Exiting.");
+    process.exit(0);
+  }
+
+  // 3. Show settings and ask to continue
+  console.log("\n--- Project Settings Summary ---");
+  console.log(`📁 Root Directory: ${_globalRootDir}`);
+  console.log(`📄 Global Styles File: ${path.join(path.basename(_globalRootDir), _globalStylesFile)}`);
+
+  const { continueSetup } = await inquirer.prompt({
+    type: "confirm",
+    name: "continueSetup",
+    message: "Are these settings correct? Continue to Main Menu?",
+    default: true,
+  });
+
+  if (!continueSetup) {
+    console.log("Project setup cancelled. Exiting.");
+    process.exit(0);
+  }
+
+  console.log("Project setup complete. Loading watchers...");
+}
+
+
+// --- Main CLI Flows ---
 
 async function createWatcherFlow() {
-  const rootDir = _globalRootDir;
+  console.log("\n--- Create New Watcher ---");
 
-  console.log(`\nUsing project root: ${rootDir}`);
-  // Use the existing promptFolderTraversal, which has the "subfolder" rule
-  const watchFolderPath = await promptFolderTraversal(rootDir);
-  if (watchFolderPath === null) { // User chose to go back
-    return;
+  // These are now guaranteed to be set by projectSettingsFlow
+  if (!_globalRootDir || !_globalStylesFile) {
+    console.error("🚫 Error: Root Directory or Global Styles File not set. Please set them in Project Settings first.");
+    return; // Just return, let the main menu loop handle continuing
   }
 
-  // Check if a watcher already exists for this exact folder
-  let existingWatcherName = null;
-  for (const [name, { config }] of watchers) {
-    const existingWatchFolderAbs = path.resolve(
-      config.rootDir,
-      config.watchDir,
-    );
-    if (existingWatchFolderAbs === watchFolderPath) {
-      existingWatcherName = name;
-      break;
-    }
+  // 1. Select the directory to watch
+  const watchDirAbsolute = await browseForDirectory(
+      _globalRootDir, // Always start watchDir Browse from the root
+      "Select the directory to watch for SCSS files:"
+  );
+  // If user cancelled or an error occurred during watch dir selection
+  if (!watchDirAbsolute) {
+    console.log("Watch directory not set. Cannot create watcher.");
+    return; // Just return, let the main menu loop handle continuing
   }
+  const watchDirRelative = path.relative(_globalRootDir, watchDirAbsolute);
+  const defaultWatcherName = path.basename(watchDirAbsolute); // Default name based on folder name
 
-  if (existingWatcherName) {
-    // Watcher exists, ask to edit or create new
-    const { action } = await inquirer.prompt([
-      {
-        type: "list",
-        name: "action",
-        message: `A watcher named "${existingWatcherName}" already exists for this folder (${path.relative(rootDir, watchFolderPath)}). What do you want to do?`,
-        choices: [
-          {
-            name: `✏️ Edit watcher "${existingWatcherName}"`,
-            value: "edit_existing",
-          },
-          {
-            name: "➕ Create a NEW watcher (for a subfolder or different styles file)",
-            value: "create_new",
-          },
-          { name: "↩️ Go back to Main Menu", value: "back" },
-        ],
-      },
-    ]);
+  // 2. Ask for watcher name, defaulting to folder name
+  const { name } = await inquirer.prompt([
+    {
+      type: "input",
+      name: "name",
+      message: "Enter a unique name for this watcher:",
+      default: defaultWatcherName, // Set default to the selected folder's name
+      validate: (input) =>
+          input.trim() !== "" && !watchers.has(input)
+              ? true
+              : "Watcher name must be unique and not empty.",
+    },
+  ]);
 
-    if (action === "edit_existing") {
-      await editWatcherFlow(existingWatcherName);
-      return; // Exit create flow
-    } else if (action === "back") {
-      return; // Exit create flow, go back to main menu
-    }
-    // If "create_new" is chosen, flow continues below for new watcher creation
-  }
+  // 3. Ask for the line number
+  const { line } = await inquirer.prompt([
+    {
+      type: "input",
+      name: "line",
+      message: "Enter the 1-indexed line number in your main SCSS file where imports should be added:",
+      validate: (input) =>
+          /^\d+$/.test(input) && parseInt(input) >= 1
+              ? true
+              : "Please enter a valid positive integer.",
+      default: 1,
+    },
+  ]);
 
-  // --- Original new watcher creation logic continues here if no existing watcher or "create new" was chosen ---
-  const stylesFile = await promptStylesFile();
-  if (stylesFile === null) {
-    // User chose to go back from styles file selection
-    return;
-  }
-  const name = await promptWatcherName(path.basename(watchFolderPath));
+  // Removed the 'addExclusions' prompt and related logic
+  let excludePaths = []; // Always initialize as empty array
 
   const config = {
-    rootDir: rootDir,
-    watchDir: path.relative(rootDir, watchFolderPath),
-    stylesFile: stylesFile, // This will now be a root-level filename
-    name,
+    rootDir: _globalRootDir, // Will always be _globalRootDir (absolute)
+    watchDir: watchDirRelative, // Stored as relative
+    stylesFile: _globalStylesFile, // Will always be _globalStylesFile (relative)
+    label: name,
+    markerId: name,
+    line: parseInt(line),
+    excludePaths: excludePaths, // Will be empty
   };
 
-  watchers.set(name, { config, instance: null });
-  // Calling updateWatcherExclusions will trigger global cleanup and then re-initialize all watchers,
-  // including the newly created one, which will correctly manage its imports.
-  updateWatcherExclusions();
+  try {
+    const instance = scssImportWatcher(config);
+    instance._initialUpdate(); // Initial generation and update
+    watchers.set(name, { config, instance, isActive: true }); // Store config, instance, and active state
+    watcherConfigs[name] = { // Save simplified config for persistence
+      name: name,
+      watchDir: watchDirRelative,
+      line: parseInt(line),
+      excludePaths: excludePaths,
+    };
+    saveConfigs(); // Save updated watcherConfigs and projectSettings
 
-  console.log("\n✅ Watcher successfully created:");
-  console.log(`   📁 Watch folder: ${config.watchDir}`);
-  console.log(`   📄 Styles file: ${config.stylesFile}`);
-  console.log(`   🏷️  Name: ${name}\n`);
-}
-
-async function editWatcherFlow(nameToEdit) {
-  const { config: oldConfig, instance: oldInstance } = watchers.get(nameToEdit);
-
-  console.log(`\n✏️ Editing watcher: "${nameToEdit}"`);
-  console.log(
-    `   Current watch folder: ${path.relative(oldConfig.rootDir, path.resolve(oldConfig.rootDir, oldConfig.watchDir))}`,
-  );
-  console.log(`   Current styles file: ${oldConfig.stylesFile}`);
-
-  let newWatchFolderPathAbs = path.resolve(
-    oldConfig.rootDir,
-    oldConfig.watchDir,
-  );
-  const { changeWatchFolder } = await inquirer.prompt([
-    {
-      type: "confirm",
-      name: "changeWatchFolder",
-      message: "Do you want to change the watch folder?",
-      default: false,
-    },
-  ]);
-  if (changeWatchFolder) {
-    // Use promptFolderTraversal here as well
-    newWatchFolderPathAbs = await promptFolderTraversal(oldConfig.rootDir);
-    if (newWatchFolderPathAbs === null) { // User chose to go back
-      return;
-    }
+    console.log(`✨ Watcher "${name}" created and started.`);
+    await refreshAllStylesFileFlags(); // Update header flag
+  } catch (error) {
+    console.error(`❌ Failed to create watcher "${name}":`, error.message);
   }
 
-  let newStylesFile = oldConfig.stylesFile;
-  const { changeStylesFile } = await inquirer.prompt([
-    {
-      type: "confirm",
-      name: "changeStylesFile",
-      message: "Do you want to change the styles file?",
-      default: false,
-    },
-  ]);
-  if (changeStylesFile) {
-    newStylesFile = await promptStylesFile();
-    if (newStylesFile === null) {
-      // User chose to go back
-      return; // Return to the previous menu (show watchers or main menu)
-    }
-  }
-
-  let newName = nameToEdit;
-  const { changeName } = await inquirer.prompt([
-    {
-      type: "confirm",
-      name: "changeName",
-      message: "Do you want to change the watcher name?",
-      default: false,
-    },
-  ]);
-  if (changeName) {
-    newName = await promptWatcherName(nameToEdit, nameToEdit); // Pass current name as excludeName
-  }
-
-  const filesToCleanExplicitly = new Set();
-  // IMPORTANT: If stylesFile changes, remove markers and delete imports from the OLD file.
-  // This is a complete re-pointing of the watcher, so old file should be cleaned.
-  if (newStylesFile !== oldConfig.stylesFile) {
-    console.log(
-      `🗑️ Cleaning up old markers AND IMPORTS for "${oldConfig.name}" from ${path.basename(oldConfig.stylesFile)}...`,
-    );
-    // Create a temporary watcher instance configured *with the old settings*
-    // to correctly target and clean up the old file.
-    const tempOldWatcher = scssImportWatcher({
-      rootDir: oldConfig.rootDir,
-      watchDir: oldConfig.watchDir, // The old watchDir is needed to form the old marker text
-      stylesFile: oldConfig.stylesFile, // The old styles file is where markers need to be removed
-      label: `CLEANUP: ${oldConfig.name}`,
-      markerId: oldConfig.name, // Use the old watcher name as marker ID for cleanup
-    });
-    tempOldWatcher.removeMarkers(true); // Pass true to delete imports entirely from the old file
-    tempOldWatcher.close(); // Close the temporary instance
-    // No need to add oldConfig.stylesFile to filesToCleanExplicitly, it's already cleaned.
-  }
-
-  // Always close the old instance as it will be re-created with updated config
-  if (oldInstance) {
-    oldInstance.close();
-  }
-
-  // If the name changed, remove the old entry from the map
-  if (newName !== nameToEdit) {
-    watchers.delete(nameToEdit);
-  }
-
-  // Create new config object with updated values
-  const newConfig = {
-    ...oldConfig, // Keep rootDir the same
-    watchDir: path.relative(oldConfig.rootDir, newWatchFolderPathAbs),
-    stylesFile: newStylesFile, // This will now be a root-level filename
-    name: newName,
-  };
-
-  // Update the map with the new config (instance will be created by updateWatcherExclusions)
-  watchers.set(newName, { config: newConfig, instance: null });
-
-  // Re-initialize all watchers to apply changes and update exclusions
-  // Pass any explicit files to clean (e.g., if stylesFile changed, its old file is handled above)
-  updateWatcherExclusions(Array.from(filesToCleanExplicitly));
-
-  console.log("\n✅ Watcher successfully updated:");
-  console.log(`   📁 Watch folder: ${newConfig.watchDir}`);
-  console.log(`   📄 Styles file: ${newConfig.stylesFile}`);
-  console.log(`   🏷️  Name: ${newConfig.name}\n`);
-}
-
-/**
- * Handles deletion of watchers, either single, multiple, or all.
- * @param {string|string[]|null} [watcherNames=null] - A single watcher name (string), an array of names, or '__all'. If null, prompts user.
- */
-async function deleteWatcherFlow(watcherNames = null) {
-  let watchersToDelete = [];
-
-  if (watcherNames === "__all") {
-    const { confirm } = await inquirer.prompt([
-      {
-        type: "confirm",
-        name: "confirm",
-        message:
-          "Are you sure you want to DELETE ALL watchers? This cannot be undone.",
-      },
-    ]);
-    if (!confirm) return;
-    watchersToDelete = Array.from(watchers.keys());
-  } else if (typeof watcherNames === "string") {
-    watchersToDelete.push(watcherNames); // Single watcher deletion
-  } else if (Array.isArray(watcherNames)) {
-    watchersToDelete = watcherNames; // Multiple watchers deletion (e.g., from checkbox)
-  } else {
-    // Prompt user to select if watcherNames is null
-    if (watchers.size === 0) {
-      console.log("⚠️ No watchers to delete.");
-      return;
-    }
-    const choices = Array.from(watchers.keys()).map((name) => ({
-      name: `${name}: ${watchers.get(name).config.watchDir} → ${watchers.get(name).config.stylesFile}`,
-      value: name,
-    }));
-    choices.push(new inquirer.Separator());
-    choices.push({ name: "🗑️ Delete ALL watchers", value: "__all" });
-    choices.push({ name: "❌ Cancel", value: "__cancel" });
-
-    const { selected } = await inquirer.prompt([
-      {
-        type: "checkbox",
-        name: "selected",
-        message: "Select watcher(s) to delete:",
-        choices,
-      },
-    ]);
-
-    if (selected.includes("__cancel") || selected.length === 0) return;
-
-    if (selected.includes("__all")) {
-      const { confirm } = await inquirer.prompt([
-        {
-          type: "confirm",
-          name: "confirm",
-          message: "Are you sure you want to DELETE ALL watchers?",
-        },
-      ]);
-      if (!confirm) return;
-      watchersToDelete = Array.from(watchers.keys());
-    } else {
-      watchersToDelete = selected;
-    }
-  }
-
-  const filesToCleanExplicitly = new Set();
-
-  for (const name of watchersToDelete) {
-    if (!watchers.has(name)) continue; // In case a watcher was already deleted by "__all" or an invalid name was passed
-
-    const { config, instance } = watchers.get(name);
-    if (instance) {
-      // Add the styles file of the deleted watcher to the explicit cleanup list.
-      // This ensures its file gets processed by global cleanup, especially if imports were left.
-      filesToCleanExplicitly.add(
-        path.resolve(_globalRootDir, config.stylesFile),
-      );
-
-      // Remove markers from the deleted watcher's file, but KEEP the import statements.
-      // These imports will become 'floating' and will be managed by global cleanup if claimed by a new watcher.
-      instance.removeMarkers(false);
-      instance.close();
-    }
-    watchers.delete(name);
-    console.log(`🗑️ Deleted watcher: ${name}`);
-  }
-
-  await updateWatcherExclusions(Array.from(filesToCleanExplicitly));
-
-  if (watchers.size === 0) {
-    console.log("All watchers have been deleted.");
-  }
+  // Removed the "Press Enter to continue..." prompt as requested.
 }
 
 async function showWatchersFlow() {
+  console.log("\n--- Current Watchers ---");
   if (watchers.size === 0) {
-    console.log("⚠️ No watchers configured yet.");
+    console.log("No watchers currently configured.");
+  } else {
+    watchers.forEach((watcherData, name) => {
+      console.log(`\nName: ${name}`);
+      console.log(`Status: ${watcherData.isActive ? '✅ Running' : '⏸️ Paused'}`);
+      console.log(`  Root Dir: ${watcherData.config.rootDir}`);
+      console.log(`  Watch Dir: ${watcherData.config.watchDir}`);
+      console.log(`  Styles File: ${watcherData.config.stylesFile}`);
+      console.log(`  Insert Line: ${watcherData.config.line}`);
+      if (watcherData.config.excludePaths && watcherData.config.excludePaths.length > 0) {
+        console.log(`  Excluded Paths:`);
+        watcherData.config.excludePaths.forEach(p => console.log(`    - ${p}`));
+      }
+    });
+  }
+  await inquirer.prompt({
+    type: "input",
+    name: "continue",
+    message: "Press Enter to continue...",
+  });
+}
+
+async function deleteWatcherFlow(watcherNameToDelete = null) {
+  if (watchers.size === 0) {
+    console.log("No watchers to delete.");
+    if (watcherNameToDelete === null) { // Only prompt if not called from exit flow
+      await inquirer.prompt({
+        type: "input",
+        name: "continue",
+        message: "Press Enter to continue...",
+      });
+    }
     return;
   }
 
-  const watcherChoices = Array.from(watchers.entries()).map(
-    ([name, { config }]) => ({
-      name: `${name}: ${config.watchDir} → ${config.stylesFile}`,
-      value: name,
-    }),
-  );
+  let selectedWatchers = [];
+  if (watcherNameToDelete) {
+    selectedWatchers.push(watcherNameToDelete);
+  } else {
+    const choices = Array.from(watchers.keys()).map((name) => ({ name }));
+    const { watchersToDelete } = await inquirer.prompt([
+      {
+        type: "checkbox",
+        name: "watchersToDelete",
+        message: "Select watcher(s) to delete:",
+        choices: choices,
+        validate: (input) =>
+            input.length > 0 ? true : "Please select at least one watcher.",
+      },
+    ]);
+    selectedWatchers = watchersToDelete;
+  }
 
-  const { selectedWatcher } = await inquirer.prompt([
+  for (const name of selectedWatchers) {
+    const watcherData = watchers.get(name);
+    if (watcherData) {
+      if (watcherData.instance) {
+        watcherData.instance.removeMarkers(true); // true to delete imports too
+        watcherData.instance.close();
+      }
+      watchers.delete(name);
+      delete watcherConfigs[name]; // Remove from persistent config
+      console.log(`🗑️ Watcher "${name}" deleted.`);
+    }
+  }
+
+  saveConfigs(); // Save updated watcherConfigs
+  await refreshAllStylesFileFlags(); // Update header flag
+
+  if (watcherNameToDelete === null) { // Only prompt if not called from exit flow
+    await inquirer.prompt({
+      type: "input",
+      name: "continue",
+      message: "Press Enter to continue...",
+    });
+  }
+}
+
+// Stop/Resume Watchers Flow
+async function stopWatchersFlow() {
+  if (watchers.size === 0) {
+    console.log("No watchers running.");
+    await inquirer.prompt({
+      type: "input",
+      name: "continue",
+      message: "Press Enter to continue...",
+    });
+    return;
+  }
+
+  const choices = Array.from(watchers.entries()).map(([name, watcherData]) => ({
+    name: `${watcherData.isActive ? '✅ Running' : '⏸️ Paused'} - ${name} (${watcherData.config.watchDir})`,
+    value: name,
+    short: name
+  }));
+
+  const { selectedWatchers } = await inquirer.prompt([
     {
-      type: "list",
-      name: "selectedWatcher",
-      message: "Select a watcher to manage:",
-      choices: [
-        ...watcherChoices,
-        new inquirer.Separator(),
-        { name: "↩️ Go back to Main Menu", value: "__back" },
-        { name: "🗑️ Delete ALL watchers", value: "__deleteAll" },
-      ],
+      type: "checkbox",
+      name: "selectedWatchers",
+      message: "Select watchers to toggle pause/resume:",
+      choices: choices,
+      validate: (input) =>
+          input.length > 0 ? true : "Please select at least one watcher.",
     },
   ]);
 
-  if (selectedWatcher === "__back") {
-    return;
-  } else if (selectedWatcher === "__deleteAll") {
-    await deleteWatcherFlow("__all");
-  } else {
-    // A specific watcher was selected
-    const { action } = await inquirer.prompt([
+  for (const name of selectedWatchers) {
+    const watcherData = watchers.get(name);
+    if (watcherData && watcherData.instance) {
+      if (watcherData.isActive) {
+        watcherData.instance.pause();
+        watcherData.isActive = false; // Update internal state in Map
+        console.log(`Watcher "${name}" paused.`);
+      } else {
+        watcherData.instance.resume();
+        watcherData.isActive = true; // Update internal state in Map
+        console.log(`Watcher "${name}" resumed.`);
+      }
+    }
+  }
+  await refreshAllStylesFileFlags(); // Update header flag
+
+  await inquirer.prompt({
+    type: "input",
+    name: "continue",
+    message: "Press Enter to continue...",
+  });
+}
+
+// General Settings Flow (now delegates to setRootDirFlow/setGlobalStylesFileFlow)
+async function generalSettingsFlow() {
+  console.log("\n--- General Settings ---");
+
+  while (true) {
+    const { settingAction } = await inquirer.prompt([
       {
         type: "list",
-        name: "action",
-        message: `Manage watcher "${selectedWatcher}":`,
+        name: "settingAction",
+        message: "Manage your project's root directory and global styles file:",
         choices: [
-          { name: "✏️ Edit this watcher", value: "edit" },
-          { name: "🗑️ Delete this watcher", value: "delete" },
-          { name: "↩️ Go back", value: "back" },
+          { name: "Set Root Directory", value: "set_root_dir" },
+          { name: "Set Global Styles File", value: "set_styles_file" },
+          { name: "⬅️ Back to Main Menu", value: "back" },
         ],
       },
     ]);
 
-    if (action === "edit") {
-      await editWatcherFlow(selectedWatcher);
-    } else if (action === "delete") {
-      await deleteWatcherFlow(selectedWatcher);
+    if (settingAction === "set_root_dir") {
+      await setRootDirFlow(); // Calls the shared flow
+    } else if (settingAction === "set_styles_file") {
+      await setGlobalStylesFileFlow(); // Calls the shared flow
+    } else if (settingAction === "back") {
+      break;
     }
-    // If "back", just return, the main menu will be shown again.
+    // Only prompt to continue if we didn't go back to main menu
+    if (settingAction !== "back") {
+      await inquirer.prompt({ type: "input", name: "c", message: "Press Enter to continue..." });
+    }
   }
 }
 
-async function mainMenu() {
-  // Prompt for root folder only once at the very beginning
-  if (!_globalRootDir) {
-    _globalRootDir = await promptRootFolder();
-    console.log(`\nProject root set to: ${_globalRootDir}\n`);
-  }
 
+// Main menu loop
+async function mainMenu() {
   while (true) {
     const { action } = await inquirer.prompt([
       {
@@ -859,8 +850,10 @@ async function mainMenu() {
         message: "Main menu:",
         choices: [
           { name: "➕ Create new watcher", value: "create" },
-          { name: "👀 Show watchers", value: "show" }, // New option
-          { name: "🗑️ Delete watcher(s)", value: "delete" }, // Renamed from "Stop"
+          { name: "⏸️ Stop/Resume watchers", value: "toggle_pause" },
+          { name: "👀 Show watchers", value: "show" },
+          { name: "🗑️ Delete watcher(s)", value: "delete" },
+          { name: "⚙️ General Settings", value: "settings" },
           { name: "🚪 Exit", value: "exit" },
         ],
       },
@@ -868,43 +861,120 @@ async function mainMenu() {
 
     if (action === "create") {
       await createWatcherFlow();
+    } else if (action === "toggle_pause") {
+      await stopWatchersFlow();
     } else if (action === "show") {
-      // New action handler
       await showWatchersFlow();
     } else if (action === "delete") {
-      // Updated action handler
-      await deleteWatcherFlow(null); // Call deleteFlow without specific names to prompt user
+      await deleteWatcherFlow(null);
+    } else if (action === "settings") {
+      await generalSettingsFlow();
     } else if (action === "exit") {
       const { confirm } = await inquirer.prompt([
         {
           type: "confirm",
           name: "confirm",
           message:
-            "Are you sure you want to exit? This will delete all watchers and clean up all their imports.",
+              "Are you sure you want to exit? This will stop all watchers and clean up all their imports.",
         },
       ]);
       if (confirm) {
-        // When exiting, delete all watchers and explicitly clean their files with full import removal.
         const allFilesToCleanOnExit = new Set();
+        // Add the global styles file for a final cleanup of its flag
+        if (_globalRootDir && _globalStylesFile) {
+          allFilesToCleanOnExit.add(path.resolve(_globalRootDir, _globalStylesFile));
+        }
+
         for (const [name, { config, instance }] of watchers) {
           if (instance) {
-            // For a clean exit, delete all markers and imports from files currently managed.
-            instance.removeMarkers(true);
-            instance.close();
+            instance.removeMarkers(true); // Always remove markers on exit
+            instance.close(); // Close the chokidar watcher instance
           }
-          allFilesToCleanOnExit.add(
-            path.resolve(_globalRootDir, config.stylesFile),
-          );
+          // Also add any other styles files used by specific watchers if the system supported multiple
+          // For now, it's just the global one.
         }
         watchers.clear();
-        // A final global cleanup for any lingering issues.
-        await cleanAndRewriteAllStylesFiles(Array.from(allFilesToCleanOnExit));
+        watcherConfigs = {}; // Clear persistent configs
+        saveConfigs(true); // Save empty watchers, but keep project settings
 
-        console.log("👋 Bye!");
+        // NEW: Update header flags one last time to clear them on exit
+        await refreshAllStylesFileFlags();
+
+        // Perform a final cleanup for all affected styles files (normalize blank lines)
+        for (const filePath of allFilesToCleanOnExit) {
+          try {
+            let content = fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : '';
+            // Consolidate blank lines to prevent excessive newlines
+            const finalContent = content.replace(/\n{3,}/g, "\n\n");
+            fs.writeFileSync(filePath, finalContent, "utf8");
+          } catch (err) {
+            console.error(`❌ Error cleaning up ${path.basename(filePath)}: ${err.message}`);
+          }
+        }
+
+        console.log("👋 Exiting. All watchers stopped and imports cleaned up.");
         process.exit(0);
       }
     }
   }
 }
 
-mainMenu();
+// Initial setup and start of the CLI
+async function startCli() {
+  loadConfigs(); // This loads watcherConfigs and projectSettings
+
+  // Initialize _globalRootDir and _globalStylesFile from loaded projectSettings
+  if (projectSettings.rootDir) {
+    _globalRootDir = projectSettings.rootDir;
+    console.log(`Loaded Root Directory: ${_globalRootDir}`);
+  }
+  if (projectSettings.stylesFile) {
+    _globalStylesFile = projectSettings.stylesFile;
+    // Log styles file relative to root for clarity
+    console.log(`Loaded Global Styles File: ${path.join(path.basename(_globalRootDir || ""), _globalStylesFile)}`);
+  }
+
+  // --- NEW: Project Setup Flow runs first ---
+  await projectSettingsFlow();
+
+  // If we reach here, project settings are confirmed or set by the user.
+  // Now, restore watchers if they exist in watcherConfigs and root/styles are set
+  if (_globalRootDir && _globalStylesFile) {
+    let restoredCount = 0;
+    for (const name in watcherConfigs) {
+      const configFromSaved = watcherConfigs[name];
+      // Ensure config uses global rootDir and stylesFile from current settings
+      const fullConfig = {
+        ...configFromSaved, // This contains name, watchDir (relative), line, excludePaths
+        rootDir: _globalRootDir, // Override rootDir to be current global one
+        stylesFile: _globalStylesFile, // Override stylesFile to be current global one
+        label: name,
+        markerId: name,
+      };
+      try {
+        const instance = scssImportWatcher(fullConfig);
+        instance._initialUpdate(); // Initial update
+        watchers.set(name, { config: fullConfig, instance, isActive: true });
+        console.log(`✨ Restored watcher "${name}".`);
+        restoredCount++;
+      } catch (error) {
+        console.error(`❌ Failed to restore watcher "${name}": ${error.message}`);
+        // Remove invalid watcher from persistent config if it failed to restore
+        delete watcherConfigs[name];
+        saveConfigs(); // Save immediately to reflect removal
+      }
+    }
+    if (restoredCount > 0) {
+      await refreshAllStylesFileFlags(); // Update header flags after restoring watchers
+    }
+  } else {
+    // This block should ideally not be reached if projectSettingsFlow ensures values are set.
+    console.log("\nProject settings are still incomplete. Please try setting them again in General Settings if you wish to proceed.");
+  }
+
+  // Finally, enter the main menu
+  mainMenu();
+}
+
+// Start the CLI application
+startCli();
