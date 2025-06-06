@@ -27,8 +27,9 @@ const SAVE_DEBOUNCE_DELAY = 500; // milliseconds
 
 // Function to get the full path to the watchers.json file
 function getWatchersConfigPath() {
+  // watchers.json must always be in the _globalRootDir
   if (!_globalRootDir) {
-    // Fallback if _globalRootDir isn't set yet (e.g., first run before prompt)
+    // This case should ideally not be hit if setupProjectRootAndStylesFile runs first
     return path.join(process.cwd(), "watchers.json");
   }
   return path.join(_globalRootDir, "watchers.json");
@@ -127,17 +128,21 @@ async function handleExternalConfigChange() {
   const oldWatcherConfigs = JSON.parse(JSON.stringify(watcherConfigs)); // Deep copy for accurate comparison later
 
   // Temporarily stop all current watchers before reloading configs
+  console.log("  Beginning process to stop all active watchers and clear their markers from styles file.");
   for (const [name, { instance }] of watchers) {
     if (instance) {
-      console.log(`  Stopping active watcher "${name}" and removing its markers for config reload...`);
+      console.log(`  Stopping active watcher "${name}" and removing its markers...`);
       instance.removeMarkers(true); // Clean up old markers AND their contents before closing
       instance.close();
+      console.log(`  Watcher "${name}" instance closed.`);
     }
+    watchers.delete(name); // Ensure it's removed from the active map
   }
   watchers.clear(); // Clear the map of active watchers
-  console.log("  All active watchers temporarily stopped.");
+  console.log("  All active watchers temporarily stopped. styles.scss should now be free of old watcher markers.");
 
   // Reload configurations from file
+  console.log("  Attempting to reload configurations from watchers.json...");
   const configLoaded = loadConfigs(); // This updates _globalRootDir, _globalStylesFile, watcherConfigs
   if (!configLoaded) {
     console.log("  Failed to reload configurations from file. Attempting to revert to previous settings and re-initialize.");
@@ -152,6 +157,8 @@ async function handleExternalConfigChange() {
     console.log("  Previous configurations restored. Watchers re-initialized.");
     return;
   }
+  console.log("  Configurations successfully reloaded.");
+
 
   let globalSettingsChanged = false;
   if (_globalRootDir !== oldGlobalRootDir) {
@@ -190,10 +197,51 @@ async function handleExternalConfigChange() {
     console.log("  No changes in global settings detected. Proceeding to re-initialize individual watchers.");
   }
 
+  // Determine which specific watcher configs changed to provide more granular messages
+  for (const newWatcherName in watcherConfigs) {
+    const oldWatcherConfig = oldWatcherConfigs[newWatcherName];
+    const newWatcherConfig = watcherConfigs[newWatcherName];
+
+    if (!oldWatcherConfig) {
+      console.log(`\n➕ New watcher "${newWatcherName}" detected.`);
+      // No need to re-initialize here, handled in the next loop.
+    } else {
+      // Compare properties to identify specific changes
+      const changes = [];
+      if (oldWatcherConfig.watchDir !== newWatcherConfig.watchDir) {
+        changes.push(`watchDir: "${oldWatcherConfig.watchDir}" -> "${newWatcherConfig.watchDir}"`);
+      }
+      if (oldWatcherConfig.line !== newWatcherConfig.line) {
+        changes.push(`line: ${oldWatcherConfig.line} -> ${newWatcherConfig.line}`);
+      }
+      if (oldWatcherConfig.markerId !== newWatcherConfig.markerId) {
+        changes.push(`markerId: "${oldWatcherConfig.markerId || 'auto'}" -> "${newWatcherConfig.markerId || 'auto'}"`);
+      }
+      // Shallow comparison for excludePaths array content
+      if (JSON.stringify(oldWatcherConfig.excludePaths) !== JSON.stringify(newWatcherConfig.excludePaths)) {
+        changes.push(`excludePaths: [${oldWatcherConfig.excludePaths.join(', ')}] -> [${newWatcherConfig.excludePaths.join(', ')}]`);
+      }
+
+      if (changes.length > 0) {
+        console.log(`\n✏️ Watcher "${newWatcherName}" updated:`);
+        changes.forEach(change => console.log(`    - ${change}`));
+      }
+    }
+  }
+
+  // Check for deleted watchers
+  for (const oldWatcherName in oldWatcherConfigs) {
+    if (!watcherConfigs[oldWatcherName]) {
+      console.log(`\n🗑️ Watcher "${oldWatcherName}" deleted.`);
+    }
+  }
+
+
   // Re-initialize all watchers based on the (potentially reverted or new) reloaded config
   // This loop will create new instances and update the styles file accordingly.
+  console.log("\n  Starting re-initialization of all watchers based on current configuration...");
   for (const name in watcherConfigs) {
-    console.log(`  Re-initializing watcher "${name}" with its updated config.`);
+    console.log(`  Re-initializing watcher "${name}"...`);
     await loadAndInitializeWatcher(name); // Use await here
   }
   console.log("✅ All watchers reloaded and reinitialized based on the current configuration.");
@@ -208,14 +256,16 @@ function listFoldersAndFiles(dir) {
         .map((entry) => `📁 ${entry.name}`); // Add folder icon
     return { folders: folders.sort() };
   } catch (error) {
-    // Return empty arrays on error, so inquirer doesn't crash on ENOENT
-    return { folders: [] };
+    console.error(`\n❌ Error reading directory ${dir}: ${error.message}`);
+    return { folders: [] }; // Return empty array on error
   }
 }
 
 // NEW FUNCTION: Generic directory browser
-async function browseForDirectory(startDir, message, isRootRestricted = false) { // Added isRootRestricted
+async function browseForDirectory(startDir, message, isRootRestricted = false, rootUpperBound = null) { // Added rootUpperBound
   let current = startDir;
+  const actualRootUpperBound = rootUpperBound || path.parse(current).root; // Default to system root if no upper bound given
+
   while (true) {
     // Validate current path to provide appropriate messages
     let isValidDir = false;
@@ -234,16 +284,16 @@ async function browseForDirectory(startDir, message, isRootRestricted = false) {
         choices: [
           {
             name: `(Current: ${isValidDir ? current : "Invalid Path"})`,
-            value: "current",
-            disabled: true,
+            value: "current_path_label",
+            disabled: true, // This is a label, not an action, should always be disabled.
           },
           ...listFoldersAndFiles(current).folders,
           new inquirer.Separator(),
           {
             name: "⬆️ Go up a directory",
             value: "up",
-            // Disable if we are at the global root and restricted, or at the system root
-            disabled: isRootRestricted ? (current === _globalRootDir) : (current === path.parse(current).root)
+            // Disable if we are at the system root OR above the restricted upper bound
+            disabled: current === actualRootUpperBound || path.relative(actualRootUpperBound, current).startsWith('..')
           },
           { name: "✅ Select this directory", value: "select", disabled: !isValidDir },
           {
@@ -261,11 +311,6 @@ async function browseForDirectory(startDir, message, isRootRestricted = false) {
     if (action === "select") {
       return current;
     } else if (action === "up") {
-      // Logic for handling 'up' should rely on the 'disabled' property,
-      // but also ensure we don't accidentally go above _globalRootDir if restricted
-      if (isRootRestricted && current === _globalRootDir) {
-        continue; // Should be disabled, but defensive check
-      }
       current = path.dirname(current);
     } else if (action === "exit") {
       return null; // User cancelled
@@ -277,8 +322,59 @@ async function browseForDirectory(startDir, message, isRootRestricted = false) {
   }
 }
 
-// NEW FUNCTION: Browse for a single SCSS file in a given directory (no traversal)
-async function browseForScssFile(searchDir, message) {
+// NEW FUNCTION: Browse for a specific file (e.g., watchers.json)
+async function browseForFile(startDir, message, fileExtension = '', fileNameOnly = null) {
+  let current = startDir;
+  while (true) {
+    let filesInDir = [];
+    try {
+      const entries = fs.readdirSync(current, { withFileTypes: true });
+      filesInDir = entries
+          .filter(entry => entry.isFile() &&
+              (fileExtension === '' || entry.name.endsWith(fileExtension)) &&
+              (fileNameOnly === null || entry.name === fileNameOnly) // Filter by exact file name if provided
+          )
+          .map(entry => `📄 ${entry.name}`)
+          .sort();
+    } catch (error) {
+      console.error(`\n❌ Error reading directory ${current}: ${error.message}`);
+    }
+
+    const { action } = await inquirer.prompt([
+      {
+        type: "list",
+        name: "action",
+        message: message,
+        choices: [
+          {
+            name: `(Current: ${current})`,
+            value: "current_path_label",
+            disabled: true,
+          },
+          ...listFoldersAndFiles(current).folders, // Show folders for navigation
+          ...filesInDir, // Show files
+          new inquirer.Separator(),
+          { name: "⬆️ Go up a directory", value: "up", disabled: current === path.parse(current).root },
+          { name: "🚪 Cancel", value: "cancel" },
+        ],
+      },
+    ]);
+
+    if (action === "cancel") {
+      return null; // User cancelled
+    } else if (action === "up") {
+      current = path.dirname(current);
+    } else if (action.startsWith("📁 ")) { // Navigating into a folder
+      current = path.join(current, action.replace("📁 ", ""));
+    } else if (action.startsWith("📄 ")) { // Selected a file
+      return path.join(current, action.replace("📄 ", ""));
+    }
+  }
+}
+
+
+// NEW FUNCTION: Browse for a single SCSS file DIRECTLY in a given directory (no recursion)
+async function browseForScssFileInDirectory(searchDir, message) {
   let scssFiles = [];
   try {
     const entries = fs.readdirSync(searchDir, { withFileTypes: true });
@@ -292,17 +388,17 @@ async function browseForScssFile(searchDir, message) {
   }
 
   if (scssFiles.length === 0) {
-    console.log(`\n⚠️ No .scss files found in ${searchDir}.`);
+    console.log(`\n⚠️ No .scss files found directly in "${searchDir}".`);
     const { retry } = await inquirer.prompt([
       {
         type: 'confirm',
         name: 'retry',
-        message: 'Do you want to select a different root directory to search for SCSS files?',
+        message: 'Do you want to re-select a file in this directory, or cancel?',
         default: true,
       },
     ]);
     if (retry) {
-      return 'RESELECT_ROOT'; // Special signal to restart root selection
+      return 'RETRY_SELECTION'; // Special signal to re-prompt for file selection in the same directory
     }
     return null; // User cancelled
   }
@@ -378,55 +474,120 @@ async function loadAndInitializeWatcher(name) {
   }
 }
 
-// Initial setup for _globalRootDir and _globalStylesFile (Moved to top level)
+// Initial setup for _globalRootDir and _globalStylesFile
 async function setupProjectRootAndStylesFile() {
   console.log("\n--- Initial Project Setup ---");
   console.log("This tool needs to know your main project root and where your primary SCSS file is located.");
 
-  let currentDir = process.cwd(); // Start Browse from current working directory
-  let rootDirSelected = false;
-  let stylesFileSelected = false;
+  let currentWorkingDir = process.cwd(); // The initial directory where the CLI was launched
 
+  // Step 1: Select Project Root
+  let rootDirSelected = false;
   while (!rootDirSelected) {
     const rootDirAbsolute = await browseForDirectory(
-        currentDir,
-        "Select your main project root directory (where watchers.json will be stored, e.g., your project's package.json directory):"
+        currentWorkingDir, // Start browsing from current working directory
+        "Select your main project root directory:",
+        true, // isRootRestricted = true (prevents going up past rootUpperBound)
+        currentWorkingDir // rootUpperBound is process.cwd()
     );
+
     if (!rootDirAbsolute) {
       console.log("Project root selection cancelled. Cannot proceed.");
-      return; // Exit if user cancels
+      process.exit(0);
     }
     _globalRootDir = rootDirAbsolute;
     rootDirSelected = true;
   }
 
-  while (!stylesFileSelected) {
-    console.log(`\nNow, select your primary SCSS file (e.g., main.scss, app.scss) from: ${_globalRootDir}`);
-    const stylesFileAbsolute = await browseForScssFile(
-        _globalRootDir, // Pass the global root dir directly
-        "Select your main SCSS file to be updated:"
-    );
+  // Step 2: Offer to Load watchers.json from the selected root
+  console.log(`\nChecking for existing watchers.json in: ${_globalRootDir}`);
+  const existingWatchersJsonPath = path.join(_globalRootDir, "watchers.json");
 
-    if (stylesFileAbsolute === 'RESELECT_ROOT') {
-      // User wants to reselect root because no SCSS files were found
-      _globalRootDir = null; // Reset root to re-trigger root selection loop
-      rootDirSelected = false; // Go back to root selection
-      continue; // Restart the outer while loop
+  let loadedSuccessfully = false;
+  let finalSetupDecisionMade = false;
+
+  if (fs.existsSync(existingWatchersJsonPath)) {
+    const { confirmLoad } = await inquirer.prompt({
+      type: "confirm",
+      name: "confirmLoad",
+      message: `Found an existing watchers.json at "${path.basename(existingWatchersJsonPath)}". Load configurations from it?`,
+      default: true,
+    });
+
+    if (confirmLoad) {
+      try {
+        const config = JSON.parse(fs.readFileSync(existingWatchersJsonPath, "utf8"));
+        const loadedRootDir = config._globalRootDir;
+        const loadedStylesFile = config._globalStylesFile;
+        const loadedWatchers = config.watchers || {};
+
+        let isValidLoad = true;
+        if (!loadedRootDir || !loadedStylesFile) {
+          console.error(`\n❌ Error: Selected watchers.json is missing required global settings (_globalRootDir or _globalStylesFile).`);
+          isValidLoad = false;
+        } else if (loadedRootDir !== _globalRootDir) {
+          // If the root dir in JSON doesn't match the one just selected, warn but allow
+          console.warn(`\n⚠️ Warning: _globalRootDir in selected watchers.json ("${loadedRootDir}") does not match the chosen project root ("${_globalRootDir}").`);
+          const { confirmRootMismatch } = await inquirer.prompt({
+            type: "confirm",
+            name: "confirmRootMismatch",
+            message: "Do you want to proceed with the project root you just selected, and use the watchers.json's other settings (this will overwrite _globalRootDir in the file)?",
+            default: true
+          });
+          if (!confirmRootMismatch) {
+            isValidLoad = false;
+          }
+        }
+
+        if (isValidLoad) {
+          // Keep the _globalRootDir that the user selected
+          // Update _globalStylesFile and watcherConfigs from the loaded JSON
+          _globalStylesFile = loadedStylesFile;
+          watcherConfigs = loadedWatchers;
+          _saveConfigsSync(); // Persist the potentially updated config (especially if root mismatch was handled)
+          console.log(`\n✅ Configuration loaded from ${path.basename(existingWatchersJsonPath)}.`);
+          loadedSuccessfully = true;
+        } else {
+          console.log("Skipping loading due to validation issues or user cancellation.");
+        }
+      } catch (error) {
+        console.error(`\n❌ Error loading or parsing watchers.json: ${error.message}`);
+      }
     }
-    if (!stylesFileAbsolute) {
-      console.log("Main SCSS file selection cancelled. Cannot proceed.");
-      _globalRootDir = null; // Reset if styles file not selected
-      return; // Exit if user cancels
-    }
-    _globalStylesFile = path.relative(_globalRootDir, stylesFileAbsolute);
-    if (!_globalStylesFile.endsWith('.scss')) {
-      console.warn("⚠️ Warning: The selected file does not have a .scss extension. Ensure it's a valid SCSS file.");
-    }
-    stylesFileSelected = true;
   }
 
-  // Save the initial project settings
-  _saveConfigsSync(); // Use synchronous save here
+  if (!loadedSuccessfully) {
+    console.log("\nNo existing watchers.json loaded or user opted for new setup. Setting up new project settings.");
+    // Ensure watchers.json is created (or overwritten if invalid/declined) as empty for the new setup
+    _saveConfigsSync(true); // Clear watchers object in config file
+
+    // Step 3: Select Main SCSS File (only if not loaded from JSON)
+    let stylesFileSelected = false;
+    while (!stylesFileSelected) {
+      console.log(`\nNow, select your primary SCSS file (e.g., main.scss, app.scss). It must be directly in: ${_globalRootDir}`);
+      const stylesFileAbsolute = await browseForScssFileInDirectory( // Use the new function for root-only files
+          _globalRootDir, // Pass the global root dir directly
+          "Select your main SCSS file to be updated (must be in the project root):"
+      );
+
+      if (stylesFileAbsolute === 'RETRY_SELECTION') {
+        // User wants to retry file selection in the *same* _globalRootDir
+        continue;
+      }
+      if (!stylesFileAbsolute) {
+        console.log("Main SCSS file selection cancelled. Cannot proceed.");
+        process.exit(0);
+      }
+      _globalStylesFile = path.relative(_globalRootDir, stylesFileAbsolute);
+      if (!_globalStylesFile.endsWith('.scss')) {
+        console.warn("⚠️ Warning: The selected file does not have a .scss extension. Ensure it's a valid SCSS file.");
+      }
+      stylesFileSelected = true;
+    }
+    _saveConfigsSync(); // Save the newly defined global styles file
+  }
+
+  // Final summary and confirmation
   console.log(`\n--- Project Settings Summary ---`);
   console.log(`📁 Project Root Set: ${_globalRootDir}`);
   console.log(`📄 Global Styles File Set: ${path.join(path.basename(_globalRootDir), _globalStylesFile)}`);
@@ -444,6 +605,7 @@ async function setupProjectRootAndStylesFile() {
   }
 }
 
+
 // Function to create a new watcher
 async function createWatcherFlow() {
   console.log("\n--- Create New Watcher ---");
@@ -451,7 +613,8 @@ async function createWatcherFlow() {
   const watchDirAbsolute = await browseForDirectory(
       _globalRootDir, // Start from the global root directory
       "Select the directory to watch for SCSS partials (cannot go outside project root):",
-      true // isRootRestricted = true
+      true, // isRootRestricted = true
+      _globalRootDir // The root upper bound for watcher directories is the project root
   );
 
   if (!watchDirAbsolute) {
@@ -687,7 +850,8 @@ async function editWatcherFlow(watcherName) {
   const newWatchDirAbsolute = await browseForDirectory(
       currentWatchDirAbsolute,
       `Select new watch directory (current: ${config.watchDir}):`,
-      true // isRootRestricted = true
+      true, // isRootRestricted = true
+      _globalRootDir // Upper bound is project root
   );
   // If user cancels browseForDirectory, it returns null. Keep old value.
   const newWatchDirRelative = newWatchDirAbsolute ? path.relative(_globalRootDir, newWatchDirAbsolute) : config.watchDir;
