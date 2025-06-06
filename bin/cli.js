@@ -284,6 +284,8 @@ async function loadAndInitializeWatcher(name) {
     ...config,
     rootDir: _globalRootDir, // This is always absolute from loadConfigs
     stylesFile: _globalStylesFile, // This is relative to _globalRootDir
+    // NEW: Pass the entire watcherConfigs for cross-watcher filtering
+    allWatchersConfigs: watcherConfigs
   };
 
   try {
@@ -605,7 +607,7 @@ async function editWatcherFlow(watcherName) {
     {
       type: "input",
       name: "newMarkerId",
-      message: `Enter new unique marker ID (current: ${config.markerId || 'auto'}):`,
+      message: "Enter new unique marker ID (current: ${config.markerId || 'auto'}):",
       default: config.markerId || '', // Provide empty string if it was 'auto'
       filter: (input) => input.trim() === '' ? undefined : input.trim(), // Use undefined for 'auto'
     },
