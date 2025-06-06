@@ -141,7 +141,7 @@ function listFoldersAndFiles(dir) {
 }
 
 // NEW FUNCTION: Generic directory browser
-async function browseForDirectory(startDir, message) {
+async function browseForDirectory(startDir, message, isRootRestricted = false) { // Added isRootRestricted
   let current = startDir;
   while (true) {
     // Validate current path to provide appropriate messages
@@ -166,9 +166,20 @@ async function browseForDirectory(startDir, message) {
           },
           ...listFoldersAndFiles(current).folders,
           new inquirer.Separator(),
-          { name: "⬆️ Go up a directory", value: "up", disabled: current === path.parse(current).root },
+          {
+            name: "⬆️ Go up a directory",
+            value: "up",
+            // Disable if we are at the global root and restricted, or at the system root
+            disabled: isRootRestricted ? (current === _globalRootDir) : (current === path.parse(current).root)
+          },
           { name: "✅ Select this directory", value: "select", disabled: !isValidDir },
-          { name: "🏠 Go to Project Root", value: "root", disabled: !_globalRootDir || current === _globalRootDir },
+          {
+            name: "🏠 Go to Project Root",
+            value: "root",
+            // Disable if project root is not set, or if already at project root,
+            // or if restricted and already at global root (to avoid redundant option)
+            disabled: !_globalRootDir || current === _globalRootDir || (isRootRestricted && current === _globalRootDir)
+          },
           { name: "🚪 Exit directory browser", value: "exit" },
         ],
       },
@@ -177,6 +188,11 @@ async function browseForDirectory(startDir, message) {
     if (action === "select") {
       return current;
     } else if (action === "up") {
+      // Logic for handling 'up' should rely on the 'disabled' property,
+      // but also ensure we don't accidentally go above _globalRootDir if restricted
+      if (isRootRestricted && current === _globalRootDir) {
+        continue; // Should be disabled, but defensive check
+      }
       current = path.dirname(current);
     } else if (action === "exit") {
       return null; // User cancelled
@@ -282,76 +298,12 @@ async function loadAndInitializeWatcher(name) {
   }
 }
 
-// Function to clean up all imports from a given styles file (used on exit or if project config changes)
-async function cleanAndRewriteAllStylesFiles() {
-  if (!_globalStylesFile || !_globalRootDir) {
-    // console.log("No global styles file or root directory configured for cleanup.");
-    return;
-  }
-
-  const absoluteStylesFilePath = path.resolve(_globalRootDir, _globalStylesFile);
-  if (!fs.existsSync(absoluteStylesFilePath)) {
-    // console.log(`Global styles file not found at ${absoluteStylesFilePath}. No cleanup needed.`);
-    return;
-  }
-
-  try {
-    let content = fs.readFileSync(absoluteStylesFilePath, "utf8");
-    const lines = content.split('\n');
-
-    // Dynamically create regex to find ALL markers for ALL watchers
-    const allMarkerIds = Object.keys(watcherConfigs).concat(
-        Array.from(watchers.keys()) // Include names of currently active watchers too
-    ).filter((value, index, self) => self.indexOf(value) === index); // Get unique IDs
-
-    let cleanedLines = [];
-    let insideMarkerBlock = false;
-    let relevantMarkerFound = false; // Flag to track if any known marker was found
-
-    // Helper to escape special characters in a string for use in a RegExp
-    function escapeRegExp(string) {
-      return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); // $& means the matched substring
-    }
-
-    const startMarkerRegexes = allMarkerIds.map(id => new RegExp(`^/\\* ${escapeRegExp(id)} import start \\*/$`, 'm'));
-    const endMarkerRegexes = allMarkerIds.map(id => new RegExp(`^/\\* ${escapeRegExp(id)} import end \\*/$`, 'm'));
-
-    for (const line of lines) {
-      let isStartMarker = startMarkerRegexes.some(regex => regex.test(line.trim()));
-      let isEndMarker = endMarkerRegexes.some(regex => regex.test(line.trim()));
-
-      if (isStartMarker) {
-        insideMarkerBlock = true;
-        relevantMarkerFound = true;
-        // Do not add start marker to cleanedLines if we are deleting it
-      } else if (isEndMarker) {
-        insideMarkerBlock = false;
-        relevantMarkerFound = true;
-        // Do not add end marker to cleanedLines if we are deleting it
-      } else if (!insideMarkerBlock) {
-        cleanedLines.push(line);
-      }
-    }
-
-    if (relevantMarkerFound) {
-      const finalContent = cleanedLines.join('\n').replace(/\n{3,}/g, '\n\n'); // Normalize multiple newlines
-      fs.writeFileSync(absoluteStylesFilePath, finalContent, "utf8");
-      console.log(`\n🧹 Cleaned up all managed import blocks in ${path.basename(absoluteStylesFilePath)}.`);
-    } else {
-      // console.log(`No managed import blocks found in ${path.basename(absoluteStylesFilePath)}. No cleanup performed.`);
-    }
-
-  } catch (error) {
-    console.error(`\n❌ Error during final styles file cleanup ${path.basename(absoluteStylesFilePath)}: ${error.message}`);
-  }
-}
-
 // Initial setup for _globalRootDir and _globalStylesFile (Moved to top level)
 async function setupProjectRootAndStylesFile() {
   console.log("\n--- Initial Project Setup ---");
   console.log("This tool needs to know your main project root and where your primary SCSS file is located.");
 
-  let currentDir = process.cwd(); // Start browsing from current working directory
+  let currentDir = process.cwd(); // Start Browse from current working directory
   let rootDirSelected = false;
   let stylesFileSelected = false;
 
@@ -415,26 +367,11 @@ async function setupProjectRootAndStylesFile() {
 // Function to create a new watcher
 async function createWatcherFlow() {
   console.log("\n--- Create New Watcher ---");
-  const { name } = await inquirer.prompt([
-    {
-      type: "input",
-      name: "name",
-      message: "Enter a unique name for the watcher:",
-      validate: (input) => {
-        if (input.trim() === "") {
-          return "Watcher name cannot be empty.";
-        }
-        if (watcherConfigs[input.trim()]) {
-          return "A watcher with this name already exists. Please choose a different name.";
-        }
-        return true;
-      },
-    },
-  ]);
 
   const watchDirAbsolute = await browseForDirectory(
-      _globalRootDir,
-      "Select the directory to watch for SCSS partials:"
+      _globalRootDir, // Start from the global root directory
+      "Select the directory to watch for SCSS partials (cannot go outside project root):",
+      true // isRootRestricted = true
   );
 
   if (!watchDirAbsolute) {
@@ -446,6 +383,24 @@ async function createWatcherFlow() {
   if (watchDirRelative === '') {
     console.warn("⚠️ Warning: Watching the project root. Ensure your main styles file is excluded if it's in the root.");
   }
+
+  const { name } = await inquirer.prompt([
+    {
+      type: "input",
+      name: "name",
+      message: "Enter a unique name for the watcher:",
+      default: path.basename(watchDirAbsolute), // Default to folder name
+      validate: (input) => {
+        if (input.trim() === "") {
+          return "Watcher name cannot be empty.";
+        }
+        if (watcherConfigs[input.trim()]) {
+          return "A watcher with this name already exists. Please choose a different name.";
+        }
+        return true;
+      },
+    },
+  ]);
 
   const { line } = await inquirer.prompt([
     {
@@ -474,12 +429,19 @@ async function createWatcherFlow() {
     },
   ]);
 
-  const excludePaths = await promptForRelativePaths(
-      _globalRootDir,
-      `Enter paths to exclude from watching (relative to ${_globalRootDir}). Separate by comma. Press Enter for none:`
-  );
+  // REMOVED: excludePaths prompt as per user request
+  // const excludePaths = await promptForRelativePaths(
+  //   _globalRootDir,
+  //   `Enter paths to exclude from watching (relative to ${_globalRootDir}). Separate by comma. Press Enter for none:`
+  // );
 
-  watcherConfigs[name] = { name, watchDir: watchDirRelative, line, markerId, excludePaths };
+  watcherConfigs[name] = {
+    name,
+    watchDir: watchDirRelative,
+    line,
+    markerId,
+    excludePaths: [] // Set to empty array since not asking
+  };
   saveConfigs();
   console.log(`\nWatcher "${name}" configured.`);
 
@@ -611,7 +573,8 @@ async function editWatcherFlow(watcherName) {
   const currentWatchDirAbsolute = path.resolve(_globalRootDir, config.watchDir);
   const newWatchDirAbsolute = await browseForDirectory(
       currentWatchDirAbsolute,
-      `Select new watch directory (current: ${config.watchDir}):`
+      `Select new watch directory (current: ${config.watchDir}):`,
+      true // isRootRestricted = true
   );
   // If user cancels browseForDirectory, it returns null. Keep old value.
   const newWatchDirRelative = newWatchDirAbsolute ? path.relative(_globalRootDir, newWatchDirAbsolute) : config.watchDir;
