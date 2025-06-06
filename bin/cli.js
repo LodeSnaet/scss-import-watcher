@@ -85,7 +85,7 @@ function startWatchingConfigFile() {
   }
   const configPath = getWatchersConfigPath();
   if (!fs.existsSync(configPath)) {
-    // If config file doesn't exist yet, we can't watch it. It will be created on save.
+    // If config file doesn't exist yet, we can't watch it. It's created on save.
     return;
   }
 
@@ -381,8 +381,8 @@ async function createWatcherFlow() {
     return;
   }
 
-  const watchDirRelative = path.relative(_globalRootDir, watchDirAbsolute);
-  if (watchDirRelative === '') {
+  const newWatcherWatchDirRelative = path.relative(_globalRootDir, watchDirAbsolute);
+  if (newWatcherWatchDirRelative === '') {
     console.warn("⚠️ Warning: Watching the project root. Ensure your main styles file is excluded if it's in the root.");
   }
 
@@ -431,23 +431,55 @@ async function createWatcherFlow() {
     },
   ]);
 
-  // REMOVED: excludePaths prompt as per user request
-  // const excludePaths = await promptForRelativePaths(
-  //   _globalRootDir,
-  //   `Enter paths to exclude from watching (relative to ${_globalRootDir}). Separate by comma. Press Enter for none:`
-  // );
-
   watcherConfigs[name] = {
     name,
-    watchDir: watchDirRelative,
+    watchDir: newWatcherWatchDirRelative,
     line,
     markerId,
-    excludePaths: [] // Set to empty array since not asking
+    excludePaths: [] // Initialize as empty for the new watcher
   };
-  saveConfigs();
+
+  // --- NEW LOGIC: Update parent watchers' excludePaths ---
+  for (const existingWatcherName in watcherConfigs) {
+    if (existingWatcherName === name) {
+      continue; // Skip the new watcher itself
+    }
+    const existingWatcherConfig = watcherConfigs[existingWatcherName];
+    const existingWatcherWatchDirAbsolute = path.resolve(_globalRootDir, existingWatcherConfig.watchDir);
+
+    // Determine if the new watcher's directory is a child of the existing watcher's directory
+    const relativePathFromExistingToNew = path.relative(existingWatcherWatchDirAbsolute, watchDirAbsolute);
+
+    // If relativePathFromExistingToNew does not start with '..' and is not empty,
+    // then newWatcherWatchDirRelative is a child of existingWatcherConfig.watchDir
+    if (!relativePathFromExistingToNew.startsWith('..') && relativePathFromExistingToNew !== '') {
+      const updatedExcludePaths = new Set(existingWatcherConfig.excludePaths);
+      updatedExcludePaths.add(newWatcherWatchDirRelative); // Add the new watcher's relative path
+
+      // Only update and re-initialize if the excludePaths actually changed (to prevent unnecessary writes/reloads)
+      if (updatedExcludePaths.size > existingWatcherConfig.excludePaths.length) {
+        existingWatcherConfig.excludePaths = Array.from(updatedExcludePaths);
+        console.log(`\n🔄 Updated excludePaths for existing watcher "${existingWatcherName}" to include "${newWatcherWatchDirRelative}".`);
+
+        // Re-initialize the parent watcher to apply the new excludePaths
+        // This will also trigger removeMarkers(true) on the old instance and then regenerate imports
+        const existingInstance = watchers.get(existingWatcherName)?.instance;
+        if (existingInstance) {
+          console.log(`Cleaning up old markers for "${existingWatcherName}"...`);
+          existingInstance.removeMarkers(true); // Clean up old markers AND their content
+          existingInstance.close(); // Close old watcher instance
+          watchers.delete(existingWatcherName); // Remove old instance from map
+        }
+        await loadAndInitializeWatcher(existingWatcherName); // Load and initialize with new config
+      }
+    }
+  }
+  // --- END NEW LOGIC ---
+
+  saveConfigs(); // Save the updated configurations (including any changes to parent watchers)
   console.log(`\nWatcher "${name}" configured.`);
 
-  await loadAndInitializeWatcher(name);
+  await loadAndInitializeWatcher(name); // Initialize the new watcher
 }
 
 // Function to show all configured watchers
@@ -632,6 +664,9 @@ async function editWatcherFlow(watcherName) {
     );
   }
 
+  // Store the old watchDir before updating for comparison later
+  const oldWatchDirRelative = config.watchDir;
+
   // Update configuration object
   config.watchDir = newWatchDirRelative;
   config.line = newLine;
@@ -641,6 +676,67 @@ async function editWatcherFlow(watcherName) {
   // Save the updated configuration to disk
   saveConfigs();
   console.log(`\n✅ Watcher "${watcherName}" configuration updated.`);
+
+  // If the watch directory changed, we might need to re-evaluate exclusions for other watchers
+  if (oldWatchDirRelative !== newWatchDirRelative) {
+    console.log(`\nWatch directory for "${watcherName}" changed. Re-evaluating exclusions for all watchers...`);
+    // Re-evaluate and re-initialize all watchers to update their exclusion lists
+    for (const nameOfOtherWatcher in watcherConfigs) {
+      const otherWatcherConfig = watcherConfigs[nameOfOtherWatcher];
+      const otherWatcherWatchDirAbsolute = path.resolve(_globalRootDir, otherWatcherConfig.watchDir);
+
+      // Check if this other watcher is a parent of the *new* watchDir
+      const relativePathFromOtherToNew = path.relative(otherWatcherWatchDirAbsolute, newWatchDirAbsolute);
+      const isOtherParentOfNew = !relativePathFromOtherToNew.startsWith('..') && relativePathFromOtherToNew !== '';
+
+      // Check if this other watcher was a parent of the *old* watchDir
+      const relativePathFromOtherToOld = path.relative(otherWatcherWatchDirAbsolute, path.resolve(_globalRootDir, oldWatchDirRelative));
+      const isOtherParentOfOld = !relativePathFromOtherToOld.startsWith('..') && relativePathFromOtherToOld !== '';
+
+      let shouldUpdateOtherWatcher = false;
+      const updatedExcludePathsSet = new Set(otherWatcherConfig.excludePaths);
+
+      if (isOtherParentOfNew) {
+        // If other watcher is now a parent of the new watchDir, ensure the new watchDir is excluded
+        if (!updatedExcludePathsSet.has(newWatchDirRelative)) {
+          updatedExcludePathsSet.add(newWatchDirRelative);
+          shouldUpdateOtherWatcher = true;
+          console.log(`Adding "${newWatchDirRelative}" to excludePaths of "${nameOfOtherWatcher}".`);
+        }
+      } else {
+        // If other watcher is NOT a parent of the new watchDir, ensure the new watchDir is NOT excluded
+        if (updatedExcludePathsSet.has(newWatchDirRelative)) {
+          updatedExcludePathsSet.delete(newWatchDirRelative);
+          shouldUpdateOtherWatcher = true;
+          console.log(`Removing "${newWatchDirRelative}" from excludePaths of "${nameOfOtherWatcher}".`);
+        }
+      }
+
+      // Also handle removal of old path if it was a child and is no longer
+      if (isOtherParentOfOld && oldWatchDirRelative !== newWatchDirRelative) {
+        if (updatedExcludePathsSet.has(oldWatchDirRelative)) {
+          updatedExcludePathsSet.delete(oldWatchDirRelative);
+          shouldUpdateOtherWatcher = true;
+          console.log(`Removing old watchDir "${oldWatchDirRelative}" from excludePaths of "${nameOfOtherWatcher}".`);
+        }
+      }
+
+
+      if (shouldUpdateOtherWatcher) {
+        otherWatcherConfig.excludePaths = Array.from(updatedExcludePathsSet);
+        // Re-initialize the other watcher to apply its updated excludePaths
+        const otherWatcherInstance = watchers.get(nameOfOtherWatcher)?.instance;
+        if (otherWatcherInstance) {
+          console.log(`Cleaning up old markers for "${nameOfOtherWatcher}"...`);
+          otherWatcherInstance.removeMarkers(true);
+          otherWatcherInstance.close();
+          watchers.delete(nameOfOtherWatcher);
+        }
+        await loadAndInitializeWatcher(nameOfOtherWatcher);
+      }
+    }
+  }
+
 
   // Re-initialize the watcher instance with new config
   const existingInstance = watchers.get(watcherName)?.instance;
@@ -706,6 +802,31 @@ async function deleteWatcherFlow(watcherToDelete = null) {
       watchers.delete(name); // Remove from active watchers map
       delete watcherConfigs[name]; // Remove from persistent config
       console.log(`\n🗑️ Watcher "${name}" deleted and imports cleaned up.`);
+
+      // --- NEW LOGIC: Remove deleted watcher's path from other watchers' excludePaths ---
+      const deletedWatcherRelativeWatchDir = watcherConfigs[name] && watcherConfigs[name].watchDir;
+      if (deletedWatcherRelativeWatchDir) {
+        for (const otherWatcherName in watcherConfigs) {
+          const otherWatcherConfig = watcherConfigs[otherWatcherName];
+          const updatedExcludePaths = new Set(otherWatcherConfig.excludePaths);
+          if (updatedExcludePaths.has(deletedWatcherRelativeWatchDir)) {
+            updatedExcludePaths.delete(deletedWatcherRelativeWatchDir);
+            otherWatcherConfig.excludePaths = Array.from(updatedExcludePaths);
+            console.log(`\n🔄 Removed "${deletedWatcherRelativeWatchDir}" from excludePaths of watcher "${otherWatcherName}".`);
+
+            // Re-initialize the other watcher to apply the updated excludePaths
+            const otherWatcherInstance = watchers.get(otherWatcherName)?.instance;
+            if (otherWatcherInstance) {
+              console.log(`Cleaning up old markers for "${otherWatcherName}"...`);
+              otherWatcherInstance.removeMarkers(true);
+              otherWatcherInstance.close();
+              watchers.delete(otherWatcherName);
+            }
+            await loadAndInitializeWatcher(otherWatcherName);
+          }
+        }
+      }
+      // --- END NEW LOGIC ---
     }
     saveConfigs(); // Save updated configs to file
   } else {
