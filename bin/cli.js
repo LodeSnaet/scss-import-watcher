@@ -20,6 +20,8 @@ let _globalRootDir = null; // Determined once at startup by user input or loaded
 let _globalStylesFile = null; // The single global styles file for all imports, stored as path relative to _globalRootDir
 
 let configFileWatcher = null; // To hold the fs.FSWatcher instance for watchers.json
+let saveTimeout = null; // For debouncing config file writes
+const SAVE_DEBOUNCE_DELAY = 500; // milliseconds
 
 // --- Helper Functions ---
 
@@ -27,38 +29,117 @@ let configFileWatcher = null; // To hold the fs.FSWatcher instance for watchers.
 function getWatchersConfigPath() {
   if (!_globalRootDir) {
     // Fallback if _globalRootDir isn't set yet (e.g., first run before prompt)
-    return path.join(process.cwd(), ".scss-import-watcher-config.json");
+    return path.join(process.cwd(), "watchers.json");
   }
-  return path.join(_globalRootDir, ".scss-import-watcher-config.json");
+  return path.join(_globalRootDir, "watchers.json");
 }
 
-// Helper to list folders in a directory for selection
-function listFolders(dir) {
+// Function to save configurations to file
+function saveConfigs(clearWatchers = false) {
+  if (saveTimeout) {
+    clearTimeout(saveTimeout);
+  }
+  saveTimeout = setTimeout(() => {
+    try {
+      const configToSave = {
+        _globalRootDir: _globalRootDir,
+        _globalStylesFile: _globalStylesFile,
+        watchers: clearWatchers ? {} : watcherConfigs, // Clear if requested
+      };
+      const configPath = getWatchersConfigPath();
+      fs.writeFileSync(configPath, JSON.stringify(configToSave, null, 2), "utf8");
+      // console.log(`Configs saved to ${configPath}`); // Removed for less clutter
+    } catch (error) {
+      console.error(`\n❌ Error saving configuration: ${error.message}`);
+    }
+  }, SAVE_DEBOUNCE_DELAY);
+}
+
+// Function to load configurations from file
+function loadConfigs() {
+  const configPath = getWatchersConfigPath();
+  if (fs.existsSync(configPath)) {
+    try {
+      const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      _globalRootDir = config._globalRootDir || null;
+      _globalStylesFile = config._globalStylesFile || null;
+      watcherConfigs = config.watchers || {};
+      console.log(`\n⚙️ Loaded configurations from ${path.basename(configPath)}.`);
+
+      // Start watching the config file itself for external changes
+      startWatchingConfigFile();
+
+      return true;
+    } catch (error) {
+      console.error(`\n❌ Error loading configuration from ${path.basename(configPath)}: ${error.message}`);
+      return false;
+    }
+  }
+  return false;
+}
+
+// Function to start watching the config file
+function startWatchingConfigFile() {
+  if (configFileWatcher) {
+    configFileWatcher.close(); // Close existing watcher if any
+  }
+  const configPath = getWatchersConfigPath();
+  if (!fs.existsSync(configPath)) {
+    // If config file doesn't exist yet, we can't watch it. It will be created on save.
+    return;
+  }
+
+  configFileWatcher = chokidar.watch(configPath, {
+    persistent: true,
+    ignoreInitial: true,
+    depth: 0, // Only watch the file itself
+  });
+
+  configFileWatcher.on('change', () => {
+    console.log(`\n🔄 Config file ${path.basename(configPath)} changed externally. Reloading watchers...`);
+    handleExternalConfigChange();
+  });
+  configFileWatcher.on('error', (error) => {
+    console.error(`\n❌ Error watching config file: ${error.message}`);
+  });
+}
+
+// Function to handle external config file changes
+async function handleExternalConfigChange() {
+  // Stop all current watchers
+  for (const [name, { instance }] of watchers) {
+    if (instance) {
+      instance.close();
+    }
+  }
+  watchers.clear(); // Clear the map of active watchers
+
+  // Reload configurations
+  loadConfigs(); // This will update _globalRootDir, _globalStylesFile, watcherConfigs
+
+  // Re-initialize all watchers based on the reloaded config
+  for (const name in watcherConfigs) {
+    await loadAndInitializeWatcher(name); // Use await here
+  }
+  console.log("✅ Watchers reloaded and reinitialized.");
+  await mainMenu(); // Return to the main menu
+}
+
+// Helper to list folders and files in a directory
+function listFoldersAndFiles(dir) {
   try {
     const entries = fs.readdirSync(dir, { withFileTypes: true });
     const folders = entries
         .filter((entry) => entry.isDirectory())
         .map((entry) => `📁 ${entry.name}`); // Add folder icon
-    return folders.sort();
+    return { folders: folders.sort() };
   } catch (error) {
-    return []; // Return empty array on error
+    // Return empty arrays on error, so inquirer doesn't crash on ENOENT
+    return { folders: [] };
   }
 }
 
-// Helper to list files in a directory for selection
-function listFiles(dir) {
-  try {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    const files = entries
-        .filter((entry) => entry.isFile() && entry.name.endsWith(".scss"))
-        .map((entry) => `📄 ${entry.name}`); // Keep icon for display
-    return files.sort();
-  } catch (error) {
-    return []; // Return empty array on error
-  }
-}
-
-// NEW FUNCTION: Generic directory browser (retained)
+// NEW FUNCTION: Generic directory browser
 async function browseForDirectory(startDir, message) {
   let current = startDir;
   while (true) {
@@ -71,515 +152,499 @@ async function browseForDirectory(startDir, message) {
       isValidDir = false; // Path does not exist or is not a directory
     }
 
-    const { selection } = await inquirer.prompt([
+    const { action } = await inquirer.prompt([
       {
         type: "list",
-        name: "selection",
-        message: `${message} (Current: ${isValidDir ? path.basename(current) : "Invalid Path"})`,
+        name: "action",
+        message: message,
         choices: [
-          { name: "✅ Select this directory", value: "__SELECT__" },
-          { name: "⬆️ Go up", value: "__GO_UP__" },
-          ...listFolders(current).map(f => ({ name: f, value: f })),
-          { name: "✏️ Enter path manually", value: "__MANUAL_INPUT__" },
+          {
+            name: `(Current: ${isValidDir ? current : "Invalid Path"})`,
+            value: "current",
+            disabled: true,
+          },
+          ...listFoldersAndFiles(current).folders,
+          new inquirer.Separator(),
+          { name: "⬆️ Go up a directory", value: "up", disabled: current === path.parse(current).root },
+          { name: "✅ Select this directory", value: "select", disabled: !isValidDir },
+          { name: "🏠 Go to Project Root", value: "root", disabled: !_globalRootDir || current === _globalRootDir },
+          { name: "🚪 Exit directory browser", value: "exit" },
         ],
-        pageSize: 10,
       },
     ]);
 
-    if (selection === "__SELECT__") {
-      if (isValidDir) {
-        return current;
-      } else {
-        console.log("❌ Cannot select an invalid directory. Please choose a valid one.");
-        continue;
-      }
-    } else if (selection === "__GO_UP__") {
-      const parent = path.dirname(current);
-      if (parent === current) { // Already at root (e.g., C:\ or /)
-        console.log("Already at the root.");
-      } else {
-        current = parent;
-      }
-    } else if (selection === "__MANUAL_INPUT__") {
-      const { manualPath } = await inquirer.prompt([
-        {
-          type: "input",
-          name: "manualPath",
-          message: "Enter the full path:",
-          default: current,
-        },
-      ]);
-      current = manualPath;
+    if (action === "select") {
+      return current;
+    } else if (action === "up") {
+      current = path.dirname(current);
+    } else if (action === "exit") {
+      return null; // User cancelled
+    } else if (action === "root") {
+      current = _globalRootDir;
     } else {
-      // It's a folder selection
-      const folderName = selection.replace(/^📁\s*/, '');
-      current = path.join(current, folderName);
+      current = path.join(current, action.replace("📁 ", "")); // Navigate into selected folder
     }
   }
 }
 
-// Function to get the styles file (retained with icon stripping)
-async function getStylesFile(rootDir) {
-  let currentDir = rootDir;
-  let selectedFile = null;
-
-  while (selectedFile === null) {
-    const fileChoices = listFiles(currentDir);
-    const { selection } = await inquirer.prompt([
-      {
-        type: "list",
-        name: "selection",
-        message: `Select your main SCSS file (in ${path.relative(rootDir, currentDir)}):`,
-        choices: [
-          { name: "⬆️ Go up", value: "__GO_UP__" },
-          ...fileChoices,
-        ],
-        pageSize: 10,
-      },
-    ]);
-
-    if (selection === "__GO_UP__") {
-      const parentDir = path.dirname(currentDir);
-      if (parentDir !== currentDir) { // Prevent going above root
-        currentDir = parentDir;
-      } else {
-        console.log("Already at the root.");
-      }
-    } else {
-      // Strip the icon and any leading/trailing whitespace
-      const fileName = selection.replace(/^[^\s]*\s*/, '').trim();
-      selectedFile = path.relative(rootDir, path.join(currentDir, fileName)); // Ensure it's relative to rootDir
-    }
-  }
-  return selectedFile;
+// NEW FUNCTION: Prompt for relative paths (e.g., excludePaths)
+async function promptForRelativePaths(baseDir, message, defaultValue = '') {
+  const { pathsInput } = await inquirer.prompt([
+    {
+      type: 'input',
+      name: 'pathsInput',
+      message: message,
+      default: defaultValue,
+      filter: (input) => input.split(',').map(p => p.trim()).filter(p => p !== ''),
+    },
+  ]);
+  // Validate that paths are indeed relative to baseDir if needed
+  // For now, just return the filtered array
+  return pathsInput;
 }
 
-// Function to save configurations to file
-function saveConfigs(cleanup = false) {
-  const configPath = getWatchersConfigPath();
-  try {
-    const dataToSave = {
-      projectSettings: {
-        rootDir: _globalRootDir,
-        stylesFile: _globalStylesFile,
-      },
-      watchers: cleanup ? {} : watcherConfigs,
-    };
-    // Ensure the directory exists
-    fs.mkdirSync(path.dirname(configPath), { recursive: true });
-    fs.writeFileSync(configPath, JSON.stringify(dataToSave, null, 2), "utf8");
-    // console.log("⚙️ Configuration saved."); // Only for debugging, too chatty
-  } catch (error) {
-    console.error("❌ Error saving config:", error.message);
-  }
-}
 
-// Function to load configurations from file
-async function loadConfigs() {
-  const configPath = getWatchersConfigPath();
-  let loadedProjectSettings = { rootDir: null, stylesFile: null };
-  let loadedWatchers = {};
-
-  if (fs.existsSync(configPath)) {
-    try {
-      const configData = JSON.parse(fs.readFileSync(configPath, "utf8"));
-      if (configData.projectSettings) {
-        loadedProjectSettings = configData.projectSettings;
-      }
-      if (configData.watchers) {
-        loadedWatchers = configData.watchers;
-      }
-    } catch (error) {
-      console.error(`❌ Error reading or parsing config file ${configPath}:`, error.message);
-      // If parsing fails, treat it as empty config
-    }
-  }
-
-  // Set global project settings directly from loaded config
-  _globalRootDir = loadedProjectSettings.rootDir;
-  _globalStylesFile = loadedProjectSettings.stylesFile;
-
-  // Load individual watcher configs
-  watcherConfigs = loadedWatchers;
-}
-
-// Function to apply changes to watcher instances based on current configuration
-async function applyWatcherChanges() {
-  const currentWatcherNames = new Set(Object.keys(watcherConfigs));
-
-  // Stop/remove watchers that are no longer in the config
-  for (const [name, { config, instance }] of watchers) {
-    if (!currentWatcherNames.has(name)) {
-      if (instance) {
-        instance.removeMarkers(true); // Remove markers AND their contents
-        instance.close();
-      }
-      watchers.delete(name);
-      console.log(`🗑️ Watcher "${name}" removed due to config change.`);
-    }
-  }
-
-  // Create/update watchers based on current config
-  for (const name in watcherConfigs) {
-    const config = watcherConfigs[name]; // This is the raw watcher config
-
-    // Construct the full config for the scssImportWatcher instance
-    // Use the *current* global project settings
-    const fullConfig = {
-      ...config,
-      rootDir: _globalRootDir,
-      stylesFile: _globalStylesFile,
-    };
-
-    if (watchers.has(name)) {
-      // Watcher exists, check if config changed (simplified for now)
-      const existing = watchers.get(name);
-      // Compare the full config (including rootDir/stylesFile from globals)
-      if (JSON.stringify(existing.config) !== JSON.stringify(fullConfig)) {
-        // Config changed, re-initialize
-        if (existing.instance) {
-          existing.instance.removeMarkers(true); // Clean old markers
-          existing.instance.close();
-        }
-        console.log(`🔄 Watcher "${name}" config changed, re-initializing.`);
-        try {
-          const newInstance = scssImportWatcher(fullConfig);
-          newInstance._initialUpdate();
-          watchers.set(name, { config: fullConfig, instance: newInstance });
-          console.log(`✅ Watcher "${name}" re-initialized successfully.`);
-        } catch (error) {
-          console.error(`❌ Failed to re-initialize watcher "${name}":`, error.message);
-        }
-      }
-    } else {
-      // New watcher
-      console.log(`➕ Creating new watcher "${name}".`);
-      try {
-        const instance = scssImportWatcher(fullConfig);
-        instance._initialUpdate();
-        watchers.set(name, { config: fullConfig, instance: instance });
-        console.log(`✅ Watcher "${name}" created successfully.`);
-      } catch (error) {
-        console.error(`❌ Failed to create watcher "${name}":`, error.message);
-      }
-    }
-  }
-}
-
-// Function to start watching the config file for changes
-function startConfigWatcher() {
-  const configPath = getWatchersConfigPath();
-  if (configFileWatcher) {
-    configFileWatcher.close(); // Close existing watcher if any
-  }
-  // Only start watching if rootDir is set, otherwise path might be invalid
-  if (_globalRootDir) {
-    configFileWatcher = chokidar.watch(configPath, { ignoreInitial: true, persistent: true });
-    configFileWatcher.on("change", async () => {
-      console.log(`\n⚙️ Config file "${path.basename(configPath)}" changed. Reloading...`);
-      await loadConfigs(); // Reload all configs, will update globals
-      await applyWatcherChanges(); // Apply changes to watchers, re-initializing as needed
-    });
-    configFileWatcher.on("unlink", () => {
-      console.log(`\n⚙️ Config file "${path.basename(configPath)}" deleted. All watchers stopped.`);
-      // Stop all watchers if config file is deleted
-      for (const [name, { instance }] of watchers) {
-        if (instance) {
-          instance.removeMarkers(true);
-          instance.close();
-        }
-      }
-      watchers.clear();
-      watcherConfigs = {}; // Reset in-memory config
-      _globalRootDir = null; // Reset global project settings
-      _globalStylesFile = null;
-    });
-    // console.log(`Watching config file: ${configPath}`); // For debugging
-  }
-}
-
-// NEW FUNCTION: Clean and rewrite all styles files after shutdown
-async function cleanAndRewriteAllStylesFiles() {
-  // Ensure we have project settings before attempting cleanup
-  if (!_globalRootDir || !_globalStylesFile) {
-    console.warn("⚠️ Cannot perform full cleanup: Project settings (rootDir or stylesFile) are missing.");
+// Function to load and initialize a single watcher
+async function loadAndInitializeWatcher(name) {
+  const config = watcherConfigs[name];
+  if (!config) {
+    console.log(`\n❌ Configuration for watcher "${name}" not found.`);
     return;
   }
 
-  const globalStylesFilePath = path.resolve(
-      _globalRootDir,
-      _globalStylesFile
-  );
+  // Ensure rootDir and stylesFile are always absolute paths
+  const fullConfig = {
+    ...config,
+    rootDir: _globalRootDir, // This is always absolute from loadConfigs
+    stylesFile: _globalStylesFile, // This is relative to _globalRootDir
+  };
 
-  if (fs.existsSync(globalStylesFilePath)) {
-    try {
-      // Create a dummy instance to use its removeMarkers function
-      const dummyInstance = scssImportWatcher({
-        rootDir: _globalRootDir,
-        stylesFile: _globalStylesFile,
-        watchDir: "dummy", // Required by scssImportWatcher constructor
-        line: 1, // Required
-        markerId: "global-cleanup" // Unique marker for global cleanup
-      });
-      dummyInstance.removeMarkers(true); // Call with deleteImports = true
-      console.log(`✅ Global styles file cleaned: ${path.basename(globalStylesFilePath)}`);
-    } catch (error) {
-      console.error(`❌ Error cleaning global styles file ${path.basename(globalStylesFilePath)}:`, error.message);
-    }
-  } else {
-    // console.log(`No global styles file found at ${path.basename(globalStylesFilePath)} for cleanup.`);
+  try {
+    const instance = scssImportWatcher(fullConfig);
+    instance._initialUpdate(); // Perform initial update to generate imports
+    watchers.set(name, { config: fullConfig, instance });
+    console.log(`\n✨ Watcher "${name}" initialized.`);
+  } catch (error) {
+    console.error(`\n❌ Error initializing watcher "${name}":`, error.message);
+    // If initialization fails, log the error but don't remove from watcherConfigs
+    // as it might be a temporary issue or misconfiguration that the user can edit.
   }
 }
 
 
-// --- CLI Flow Functions ---
-
+// Function to create a new watcher
 async function createWatcherFlow() {
-  // Use _globalRootDir as base for watchDir selection
-  const watchDir = await browseForDirectory(
-      _globalRootDir,
-      `Select the directory to watch for SCSS partials (relative to ${path.basename(_globalRootDir)}):`
-  );
-  // Store watchDir relative to rootDir
-  const relativeWatchDir = path.relative(_globalRootDir, watchDir);
-
-  // Derive default watcher name from the selected watch directory
-  const defaultWatcherName = path.basename(relativeWatchDir);
-
+  console.log("\n--- Create New Watcher ---");
   const { name } = await inquirer.prompt([
     {
       type: "input",
       name: "name",
-      message: "Enter a unique name for this watcher:", // Removed example text
-      default: defaultWatcherName, // Set default to folder name
-      validate: (input) =>
-          input.length > 0 && !watcherConfigs[input]
-              ? true
-              : "Name cannot be empty and must be unique.",
+      message: "Enter a unique name for the watcher:",
+      validate: (input) => {
+        if (input.trim() === "") {
+          return "Watcher name cannot be empty.";
+        }
+        if (watcherConfigs[input.trim()]) {
+          return "A watcher with this name already exists. Please choose a different name.";
+        }
+        return true;
+      },
     },
   ]);
+
+  const watchDirAbsolute = await browseForDirectory(
+      _globalRootDir,
+      "Select the directory to watch for SCSS partials:"
+  );
+
+  if (!watchDirAbsolute) {
+    console.log("Watcher creation cancelled: No watch directory selected.");
+    return;
+  }
+
+  const watchDirRelative = path.relative(_globalRootDir, watchDirAbsolute);
+  if (watchDirRelative === '') {
+    console.warn("⚠️ Warning: Watching the project root. Ensure your main styles file is excluded if it's in the root.");
+  }
 
   const { line } = await inquirer.prompt([
     {
       type: "input",
       name: "line",
-      message: `Enter the 1-indexed line number in your main SCSS file (${_globalStylesFile}) where imports should be added:`,
-      validate: (input) =>
-          /^\d+$/.test(input) && parseInt(input) > 0
-              ? true
-              : "Please enter a valid positive line number.",
+      message: `Enter the 1-indexed line number in ${_globalStylesFile} where imports should be inserted:`,
+      default: 1,
+      validate: (input) => {
+        const num = parseInt(input);
+        if (isNaN(num) || num <= 0) {
+          return "Please enter a valid positive number.";
+        }
+        return true;
+      },
       filter: Number,
     },
   ]);
 
-  // Optional: Exclude paths
-  const excludePathsList = [];
-  const { confirmExclude } = await inquirer.prompt([
+  const { markerId } = await inquirer.prompt([
     {
-      type: "confirm",
-      name: "confirmExclude",
-      message: "Do you want to add any exclusion paths? (e.g., node_modules, dist)",
-      default: false,
+      type: "input",
+      name: "markerId",
+      message: "Enter a unique marker ID for this watcher (optional, defaults to watchDir name):",
+      default: '',
+      filter: (input) => input.trim() === '' ? undefined : input.trim(), // Use undefined to signal default behavior
     },
   ]);
 
-  if (confirmExclude) {
-    let addMore = true;
-    while (addMore) {
-      const excludedPath = await browseForDirectory(
-          _globalRootDir,
-          `Select a path to exclude (relative to ${path.basename(_globalRootDir)}):`
-      );
-      excludePathsList.push(path.resolve(_globalRootDir, excludedPath)); // Store absolute path
-      const { anotherExclude } = await inquirer.prompt([
-        {
-          type: "confirm",
-          name: "anotherExclude",
-          message: "Add another exclusion path?",
-          default: false,
-        },
-      ]);
-      addMore = anotherExclude;
-    }
-  }
+  const excludePaths = await promptForRelativePaths(
+      _globalRootDir,
+      `Enter paths to exclude from watching (relative to ${_globalRootDir}). Separate by comma. Press Enter for none:`
+  );
 
-  // Store the new watcher config
-  watcherConfigs[name] = {
-    name,
-    watchDir: relativeWatchDir, // Store relative path
-    line,
-    excludePaths: excludePathsList, // Store absolute paths
-  };
+  watcherConfigs[name] = { name, watchDir: watchDirRelative, line, markerId, excludePaths };
+  saveConfigs();
+  console.log(`\nWatcher "${name}" configured.`);
 
-  saveConfigs(); // Save the new watcher
-  await applyWatcherChanges(); // Apply the new watcher
+  await loadAndInitializeWatcher(name);
 }
 
-async function showWatchersFlow() {
-  if (Object.keys(watcherConfigs).length === 0) {
-    console.log("🤷 No watchers configured yet. Create one first!");
-    return;
+// NEW FUNCTION: Manage Watcher Details
+async function manageWatcherDetails(watcherName) {
+  const watcherData = watchers.get(watcherName); // Get live instance data
+  const config = watcherConfigs[watcherName]; // Get persistent config
+
+  if (!config) {
+    console.log(`\n❌ Watcher "${watcherName}" configuration not found.`);
+    return; // Should not happen if selected from list
   }
 
-  console.log("\n--- Active Watchers ---");
-  console.log(`Project Root: ${_globalRootDir}`);
-  console.log(`Styles File: ${_globalStylesFile}`);
+  console.log(`\n--- Details for Watcher: ${config.name} ---`);
+  console.log(`  Watch Directory (relative to root): ${config.watchDir}`);
+  console.log(`  Watch Directory (absolute): ${path.resolve(_globalRootDir, config.watchDir)}`);
+  console.log(`  Insert Line: ${config.line}`);
+  console.log(`  Marker ID: ${config.markerId || 'auto'}`);
+  console.log(`  Exclude Paths (relative to root): ${config.excludePaths && config.excludePaths.length > 0 ? config.excludePaths.join(', ') : 'None'}`);
 
-  for (const name in watcherConfigs) {
-    const config = watcherConfigs[name];
-    const instanceEntry = watchers.get(name);
-    const status = instanceEntry ? (instanceEntry.instance.getIsActive() ? "Active" : "Paused") : "Inactive";
-    const statusIcon = instanceEntry ? (instanceEntry.instance.getIsActive() ? "🟢" : "⏸️") : "🔴";
+  let currentImports = [];
+  let isActive = false;
 
-    console.log(`\n${statusIcon} Name: ${name}`);
-    console.log(`   Watch Dir: ${config.watchDir}`);
-    console.log(`   Line: ${config.line}`);
-    console.log(`   Status: ${status}`);
-    if (config.excludePaths && config.excludePaths.length > 0) {
-      console.log(`   Excluded: ${config.excludePaths.map(p => path.relative(_globalRootDir, p)).join(', ')}`);
+  if (watcherData && watcherData.instance) {
+    isActive = watcherData.instance.getIsActive();
+    console.log(`  Status: ${isActive ? '✅ Active' : '⏸️ Paused'}`);
+    currentImports = watcherData.instance._getGeneratedImportPaths();
+    console.log(`\n--- Current Imports ---`);
+    if (currentImports.length > 0) {
+      currentImports.forEach(imp => console.log(`  @import "${imp}";`)); // Added @import string
+    } else {
+      console.log(`  No imports generated yet, or no SCSS partials found.`);
     }
-
-    // Show current imports if instance is active
-    if (instanceEntry && instanceEntry.instance.getIsActive()) {
-      const currentImports = instanceEntry.instance._getGeneratedImportPaths();
-      if (currentImports.length > 0) {
-        console.log(`   Current Imports (${currentImports.length}):`);
-        currentImports.forEach(imp => console.log(`     - ${imp}`));
-      } else {
-        console.log("   No imports generated yet for this watcher.");
-      }
-    }
+  } else {
+    console.log(`  Status: 🔴 Inactive (Instance not running or failed to initialize)`);
+    console.log(`\n--- Current Imports ---`);
+    console.log(`  No imports available (watcher instance not active).`);
   }
-  console.log("-----------------------\n");
+  console.log(`------------------------`);
 
   const { action } = await inquirer.prompt([
     {
       type: "list",
       name: "action",
-      message: "Watcher actions:",
+      message: `Actions for "${config.name}":`,
       choices: [
-        { name: "⏯️ Pause/Resume watcher(s)", value: "toggle_pause" },
-        { name: "🗑️ Delete watcher(s)", value: "delete" },
-        { name: "↩️ Back to main menu", value: "back" },
+        { name: "✏️ Edit Watcher Settings", value: "edit" },
+        { name: "🔙 Back to Show Watchers", value: "back" },
       ],
     },
   ]);
 
-  if (action === "toggle_pause") {
-    await togglePauseWatcherFlow();
-  } else if (action === "delete") {
-    await deleteWatcherFlow();
+  if (action === "edit") {
+    await editWatcherFlow(watcherName);
+    // After editing, show details again
+    await manageWatcherDetails(watcherName); // Re-show details after edit
+  } else if (action === "back") {
+    await showWatchersFlow(); // Go back to the list
   }
 }
 
-async function deleteWatcherFlow() {
-  if (Object.keys(watcherConfigs).length === 0) {
-    console.log("🤷 No watchers to delete.");
+// NEW FUNCTION: Edit Watcher Flow
+async function editWatcherFlow(watcherName) {
+  const config = watcherConfigs[watcherName];
+  if (!config) {
+    console.log(`\n❌ Watcher "${watcherName}" configuration not found.`);
     return;
   }
 
-  const watcherNames = Object.keys(watcherConfigs);
-  const { watchersToDelete } = await inquirer.prompt([
+  const { confirmEdit } = await inquirer.prompt([
     {
-      type: "checkbox",
-      name: "watchersToDelete",
-      message: "Select watcher(s) to delete:",
-      choices: watcherNames,
-      validate: (input) =>
-          input.length > 0 ? true : "Please select at least one watcher.",
+      type: "confirm",
+      name: "confirmEdit",
+      message: `Are you sure you want to proceed editing "${watcherName}"? This won't break anything, but it will change the watcher's settings and update its imports.`,
+      default: false,
     },
   ]);
+
+  if (!confirmEdit) {
+    console.log(`\nEdit for "${watcherName}" cancelled.`);
+    return;
+  }
+
+  console.log(`\n--- Editing Watcher: ${watcherName} ---`);
+  console.log(`(Press Enter to keep current value)`);
+
+  // Prompt for new watchDir
+  const currentWatchDirAbsolute = path.resolve(_globalRootDir, config.watchDir);
+  const newWatchDirAbsolute = await browseForDirectory(
+      currentWatchDirAbsolute,
+      `Select new watch directory (current: ${config.watchDir}):`
+  );
+  // If user cancels browseForDirectory, it returns null. Keep old value.
+  const newWatchDirRelative = newWatchDirAbsolute ? path.relative(_globalRootDir, newWatchDirAbsolute) : config.watchDir;
+
+
+  // Prompt for new line number
+  const { newLine } = await inquirer.prompt([
+    {
+      type: "input",
+      name: "newLine",
+      message: `Enter new line number for imports (current: ${config.line}):`,
+      validate: (input) => {
+        // Allow empty string to keep current value
+        if (input.trim() === '') return true;
+        const num = parseInt(input);
+        if (isNaN(num) || num <= 0) {
+          return "Please enter a valid positive number.";
+        }
+        return true;
+      },
+      default: String(config.line), // Convert to string for default
+      filter: (input) => input.trim() === '' ? config.line : parseInt(input), // Filter to keep original if empty, otherwise parse
+    },
+  ]);
+
+  // Prompt for new markerId
+  const { newMarkerId } = await inquirer.prompt([
+    {
+      type: "input",
+      name: "newMarkerId",
+      message: `Enter new unique marker ID (current: ${config.markerId || 'auto'}):`,
+      default: config.markerId || '', // Provide empty string if it was 'auto'
+      filter: (input) => input.trim() === '' ? undefined : input.trim(), // Use undefined for 'auto'
+    },
+  ]);
+
+  // Prompt to edit exclude paths
+  const { editExcludePaths } = await inquirer.prompt([
+    {
+      type: "confirm",
+      name: "editExcludePaths",
+      message: `Do you want to edit exclude paths? (Current: ${config.excludePaths && config.excludePaths.length > 0 ? config.excludePaths.join(', ') : 'None'})`,
+      default: false,
+    },
+  ]);
+
+  let newExcludePaths = config.excludePaths || [];
+  if (editExcludePaths) {
+    newExcludePaths = await promptForRelativePaths(
+        _globalRootDir,
+        `Enter new exclude paths (relative to ${_globalRootDir}). Separate by comma. Press Enter for none:`,
+        newExcludePaths.join(',')
+    );
+  }
+
+  // Update configuration object
+  config.watchDir = newWatchDirRelative;
+  config.line = newLine;
+  config.markerId = newMarkerId;
+  config.excludePaths = newExcludePaths;
+
+  // Save the updated configuration to disk
+  saveConfigs();
+  console.log(`\n✅ Watcher "${watcherName}" configuration updated.`);
+
+  // Re-initialize the watcher instance with new config
+  const existingInstance = watchers.get(watcherName)?.instance;
+  if (existingInstance) {
+    console.log(`\nCleaning up old markers for "${watcherName}"...`);
+    existingInstance.removeMarkers(true); // Clean up old markers AND their content
+    existingInstance.close(); // Close old watcher instance
+    watchers.delete(watcherName); // Remove old instance from map
+  }
+
+  // Load and initialize the watcher with the new configuration
+  await loadAndInitializeWatcher(watcherName);
+
+  console.log(`\nWatcher "${watcherName}" reinitialized with new settings.`);
+}
+
+
+// Function to show all configured watchers
+async function showWatchersFlow() {
+  if (Object.keys(watcherConfigs).length === 0) {
+    console.log("\nNo watchers configured yet.");
+    return;
+  }
+
+  const watcherChoices = Object.keys(watcherConfigs).map((name) => {
+    const watcherData = watchers.get(name);
+    // Check if instance exists and is active
+    const isActive = watcherData && watcherData.instance ? watcherData.instance.getIsActive() : false;
+    return {
+      name: `${name} (${isActive ? '✅ Active' : '🔴 Inactive'}) - Watch: ${watcherConfigs[name].watchDir}`,
+      value: name,
+    };
+  });
+
+  const { selectedWatcher } = await inquirer.prompt([
+    {
+      type: "list",
+      name: "selectedWatcher",
+      message: "Select a watcher to view details or edit:",
+      choices: [
+        ...watcherChoices,
+        new inquirer.Separator(),
+        { name: "🔙 Back to Main Menu", value: "back" },
+      ],
+    },
+  ]);
+
+  if (selectedWatcher && selectedWatcher !== "back") {
+    await manageWatcherDetails(selectedWatcher);
+  }
+  // If 'back' is selected or no watchers, it will naturally return to main menu loop
+}
+
+
+// Function to delete one or more watchers
+async function deleteWatcherFlow(watcherToDelete = null) {
+  if (Object.keys(watcherConfigs).length === 0) {
+    console.log("\nNo watchers to delete.");
+    return;
+  }
+
+  let choices = Object.keys(watcherConfigs).map((name) => ({
+    name: name,
+    value: name,
+  }));
+
+  if (watcherToDelete === null) {
+    const { watchersSelected } = await inquirer.prompt([
+      {
+        type: "checkbox",
+        name: "watchersSelected",
+        message: "Select watcher(s) to delete:",
+        choices: choices,
+        validate: (input) =>
+            input.length > 0 ? true : "Please select at least one watcher.",
+      },
+    ]);
+    watcherToDelete = watchersSelected; // Array of names
+  } else {
+    // If a single watcher was passed directly (e.g., from an error handler)
+    watcherToDelete = [watcherToDelete]; // Convert to array for consistent processing
+  }
 
   const { confirmDelete } = await inquirer.prompt([
     {
       type: "confirm",
       name: "confirmDelete",
-      message: `Are you sure you want to delete ${watchersToDelete.join(", ")}? This will also clean up their imports.`,
+      message: `Are you sure you want to delete ${watcherToDelete.length} watcher(s)? This will remove their configuration and clean up their imports from ${_globalStylesFile}.`,
       default: false,
     },
   ]);
 
   if (confirmDelete) {
-    for (const name of watchersToDelete) {
-      const entry = watchers.get(name);
-      if (entry && entry.instance) {
-        entry.instance.removeMarkers(true); // Remove markers AND their contents
-        entry.instance.close();
+    for (const name of watcherToDelete) {
+      const watcherData = watchers.get(name);
+      if (watcherData && watcherData.instance) {
+        watcherData.instance.removeMarkers(true); // Remove markers AND their contents
+        watcherData.instance.close(); // Close the watcher instance
       }
       watchers.delete(name); // Remove from active watchers map
       delete watcherConfigs[name]; // Remove from persistent config
-      console.log(`🗑️ Watcher "${name}" deleted.`);
+      console.log(`\n🗑️ Watcher "${name}" deleted and imports cleaned up.`);
     }
-    saveConfigs(); // Save updated configs
+    saveConfigs(); // Save updated configs to file
+  } else {
+    console.log("\nDeletion cancelled.");
   }
 }
 
-async function togglePauseWatcherFlow() {
-  if (Object.keys(watcherConfigs).length === 0) {
-    console.log("🤷 No watchers to pause/resume.");
+// Function to clean up all imports from a given styles file (used on exit or if project config changes)
+async function cleanAndRewriteAllStylesFiles() {
+  if (!_globalStylesFile || !_globalRootDir) {
+    // console.log("No global styles file or root directory configured for cleanup.");
     return;
   }
 
-  const watcherChoices = Object.keys(watcherConfigs).map(name => {
-    const entry = watchers.get(name);
-    const status = entry && entry.instance ? (entry.instance.getIsActive() ? "Active" : "Paused") : "Inactive";
-    const statusIcon = entry && entry.instance ? (entry.instance.getIsActive() ? "🟢" : "⏸️") : "🔴";
-    return { name: `${statusIcon} ${name} (${status})`, value: name };
-  });
+  const absoluteStylesFilePath = path.resolve(_globalRootDir, _globalStylesFile);
+  if (!fs.existsSync(absoluteStylesFilePath)) {
+    // console.log(`Global styles file not found at ${absoluteStylesFilePath}. No cleanup needed.`);
+    return;
+  }
 
-  const { watchersToToggle } = await inquirer.prompt([
-    {
-      type: "checkbox",
-      name: "watchersToToggle",
-      message: "Select watcher(s) to pause/resume:",
-      choices: watcherChoices,
-      validate: (input) =>
-          input.length > 0 ? true : "Please select at least one watcher.",
-    },
-  ]);
+  try {
+    let content = fs.readFileSync(absoluteStylesFilePath, "utf8");
+    const lines = content.split('\n');
 
-  for (const name of watchersToToggle) {
-    const entry = watchers.get(name);
-    if (entry && entry.instance) {
-      if (entry.instance.getIsActive()) {
-        entry.instance.pause();
-      } else {
-        entry.instance.resume();
+    // Dynamically create regex to find ALL markers for ALL watchers
+    const allMarkerIds = Object.keys(watcherConfigs).concat(
+        Array.from(watchers.keys()) // Include names of currently active watchers too
+    ).filter((value, index, self) => self.indexOf(value) === index); // Get unique IDs
+
+    let cleanedLines = [];
+    let insideMarkerBlock = false;
+    let relevantMarkerFound = false; // Flag to track if any known marker was found
+
+    const startMarkerRegexes = allMarkerIds.map(id => new RegExp(`^/\\* ${escapeRegExp(id)} import start \\*/$`, 'm'));
+    const endMarkerRegexes = allMarkerIds.map(id => new RegExp(`^/\\* ${escapeRegExp(id)} import end \\*/$`, 'm'));
+
+    for (const line of lines) {
+      let isStartMarker = startMarkerRegexes.some(regex => regex.test(line.trim()));
+      let isEndMarker = endMarkerRegexes.some(regex => regex.test(line.trim()));
+
+      if (isStartMarker) {
+        insideMarkerBlock = true;
+        relevantMarkerFound = true;
+        // Do not add start marker to cleanedLines if we are deleting it
+      } else if (isEndMarker) {
+        insideMarkerBlock = false;
+        relevantMarkerFound = true;
+        // Do not add end marker to cleanedLines if we are deleting it
+      } else if (!insideMarkerBlock) {
+        cleanedLines.push(line);
       }
-    } else {
-      console.warn(`⚠️ Watcher "${name}" is not active and cannot be toggled.`);
     }
+
+    if (relevantMarkerFound) {
+      const finalContent = cleanedLines.join('\n').replace(/\n{3,}/g, '\n\n'); // Normalize multiple newlines
+      fs.writeFileSync(absoluteStylesFilePath, finalContent, "utf8");
+      console.log(`\n🧹 Cleaned up all managed import blocks in ${path.basename(absoluteStylesFilePath)}.`);
+    } else {
+      // console.log(`No managed import blocks found in ${path.basename(absoluteStylesFilePath)}. No cleanup performed.`);
+    }
+
+  } catch (error) {
+    console.error(`\n❌ Error during final styles file cleanup ${path.basename(absoluteStylesFilePath)}: ${error.message}`);
   }
 }
 
 
-// --- Main Menu and Application Flow ---
-
+// --- Main Menu Flow ---
 async function mainMenu() {
-  // Load existing configurations at startup
-  await loadConfigs();
-
-  // If rootDir and stylesFile are missing (first run or config deleted), prompt for them
+  // Ensure _globalRootDir and _globalStylesFile are set before entering the loop
   if (!_globalRootDir || !_globalStylesFile) {
-    console.log("Welcome to SCSS Import Watcher! Let's set up your project first.");
-
-    if (!_globalRootDir) {
-      _globalRootDir = await browseForDirectory(
-          process.cwd(),
-          "Select your project's root directory:"
-      );
+    // If no config loaded or incomplete, prompt for initial setup
+    await setupProjectRootAndStylesFile();
+    if (!_globalRootDir || !_globalStylesFile) {
+      console.log("\nInitial setup incomplete. Exiting.");
+      process.exit(0);
     }
-    if (!_globalStylesFile) {
-      _globalStylesFile = await getStylesFile(_globalRootDir);
-    }
-    saveConfigs(); // Save initial project settings
   }
 
-  // Start watching the config file after initial load/setup
-  startConfigWatcher();
-
-  // Apply changes to watcher instances based on loaded configs
-  await applyWatcherChanges();
+  // Initialize all watchers on startup (after rootDir/stylesFile are known)
+  for (const name in watcherConfigs) {
+    if (!watchers.has(name)) { // Only initialize if not already running
+      await loadAndInitializeWatcher(name);
+    }
+  }
 
   while (true) {
     const { action } = await inquirer.prompt([
@@ -601,14 +666,14 @@ async function mainMenu() {
     } else if (action === "show") {
       await showWatchersFlow();
     } else if (action === "delete") {
-      await deleteWatcherFlow();
+      await deleteWatcherFlow(null);
     } else if (action === "exit") {
       const { confirm } = await inquirer.prompt([
         {
           type: "confirm",
           name: "confirm",
           message:
-              "Are you sure you want to exit? This will stop all watchers and clean up all their imports in the main styles file.",
+              "Are you sure you want to exit? This will delete all watchers and clean up all their imports.",
         },
       ]);
       if (confirm) {
@@ -638,7 +703,52 @@ async function mainMenu() {
   }
 }
 
+// Initial setup for _globalRootDir and _globalStylesFile
+async function setupProjectRootAndStylesFile() {
+  console.log("\n--- Initial Project Setup ---");
+  console.log("This tool needs to know your main project root and where your primary SCSS file is located.");
+
+  let currentDir = process.cwd(); // Start Browse from current working directory
+
+  if (!_globalRootDir) {
+    const rootDirAbsolute = await browseForDirectory(
+        currentDir,
+        "Select your main project root directory (where watchers.json will be stored, e.g., your project's package.json directory):"
+    );
+    if (!rootDirAbsolute) {
+      console.log("Project root selection cancelled. Cannot proceed.");
+      return;
+    }
+    _globalRootDir = rootDirAbsolute;
+  }
+
+  if (!_globalStylesFile) {
+    console.log(`\nNow, select your primary SCSS file (e.g., main.scss, app.scss) relative to: ${_globalRootDir}`);
+    const stylesFileAbsolute = await browseForDirectory(
+        _globalRootDir, // Start Browse from the selected project root
+        "Select your main SCSS file to be updated:"
+    );
+
+    if (!stylesFileAbsolute) {
+      console.log("Main SCSS file selection cancelled. Cannot proceed.");
+      _globalRootDir = null; // Reset if styles file not selected
+      return;
+    }
+    _globalStylesFile = path.relative(_globalRootDir, stylesFileAbsolute);
+    if (!_globalStylesFile.endsWith('.scss')) {
+      console.warn("⚠️ Warning: The selected file does not have a .scss extension. Ensure it's a valid SCSS file.");
+    }
+  }
+
+  // Save the initial project settings
+  saveConfigs();
+  console.log(`\nProject Root Set: ${_globalRootDir}`);
+  console.log(`Global Styles File Set: ${_globalStylesFile}`);
+}
+
 // Start the main menu flow
+// Load configs first, then proceed to main menu
+loadConfigs();
 mainMenu();
 
 // Graceful shutdown on Ctrl+C
